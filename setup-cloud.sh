@@ -1,23 +1,17 @@
-﻿#!/usr/bin/env bash
-set -e
-
 echo "=== Setting up BL WhatsApp Inbox on Cloud VM ==="
 
-# 1. Install Docker & Git if not present
-if ! command -v docker &> /dev/null; then
-    echo "Installing Docker..."
-    sudo apt update
-    sudo apt install -y ca-certificates curl gnupg git
-    sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg || true
-    sudo chmod a+r /etc/apt/keyrings/docker.gpg || true
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null || true
-    sudo apt update
-    sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || sudo apt install -y docker.io docker-compose-v2
-    sudo usermod -aG docker $USER
-fi
+# 1. Clean broken repo if present
+sudo rm -f /etc/apt/sources.list.d/docker.list
 
-# 2. Clone repository
+# 2. Install Docker & Git directly from Debian repositories
+echo "Installing Docker and Git..."
+sudo apt update
+sudo apt install -y docker.io docker-compose-v2 git curl
+
+sudo systemctl enable --now docker 2>/dev/null || sudo service docker start 2>/dev/null || true
+sudo usermod -aG docker  2>/dev/null || true
+
+# 3. Clone repository
 if [ ! -d "Whatsapp_BL" ]; then
     echo "Cloning repository..."
     git clone https://github.com/praneethacsk/Whatsapp_BL.git
@@ -25,7 +19,7 @@ fi
 
 cd Whatsapp_BL
 
-# 3. Setup environment variables
+# 4. Setup environment variables
 if [ ! -f ".env" ]; then
     echo "Configuring .env..."
     cp .env.example .env
@@ -37,7 +31,7 @@ if [ ! -f ".env" ]; then
     sed -i "s/CENTRIFUGO_API_KEY=development-centrifugo-api-key/CENTRIFUGO_API_KEY=${CENT_KEY}/" .env
 fi
 
-# 4. Start infrastructure with Docker Compose
+# 5. Start infrastructure with Docker Compose
 echo "Starting backend infrastructure..."
 sudo docker compose up -d
 
