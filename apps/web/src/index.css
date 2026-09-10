@@ -1,0 +1,317 @@
+@import "tailwindcss";
+
+/**
+ * Dark Mode Color Hierarchy:
+ * - dark-primary (#111B21): Main background (chat area, page background)
+ * - dark-secondary (#1F2C33): Elevated surfaces (sidebar, header, composer)
+ * - dark-elevated (#202C33): Cards, message bubbles (received)
+ * - dark-tertiary (#2A3942): Interactive elements (selected items, inputs)
+ * - dark-border (#2F3B43): Border color for separation
+ * - dark-text-primary (#E9EDEF): Main text
+ * - dark-text-secondary (#8696A0): Secondary text, timestamps
+ * - dark-text-tertiary (#667781): Tertiary text, placeholders
+ *
+ * Brand colors (whatsapp-green, whatsapp-teal-green) work in both themes.
+ */
+
+/* Enable class-based dark mode for Tailwind v4 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-ring: #25d366;
+  --color-whatsapp-green: #25d366;
+  --color-whatsapp-dark-green: #128c7e;
+  --color-whatsapp-teal-green: #075e54;
+  --color-whatsapp-blue: #34b7f1;
+
+  /* Accessible color variants for WCAG AA compliance (4.5:1 contrast ratio required)
+   * - whatsapp-green-a11y-text: For text on white background (darker green)
+   * - whatsapp-green-a11y-button: For button backgrounds with white text (darker green)
+   */
+  --color-whatsapp-green-a11y-text: #0a7c43; /* Contrast 4.52:1 on white */
+  --color-whatsapp-green-a11y-button: #075e54; /* Teal green, contrast 6.83:1 with white text */
+
+  /* Dark mode semantic colors */
+  --color-dark-primary: #111b21;
+  --color-dark-secondary: #1f2c33;
+  --color-dark-elevated: #202c33;
+  --color-dark-tertiary: #2a3942;
+  --color-dark-border: #2f3b43;
+  --color-dark-text-primary: #e9edef;
+  --color-dark-text-secondary: #8696a0;
+  --color-dark-text-tertiary: #667781;
+}
+
+@layer base {
+  * {
+    border-color: theme("colors.gray.200");
+  }
+
+  .dark * {
+    border-color: theme("colors.dark-border");
+  }
+
+  body {
+    color: theme("colors.gray.900");
+    background-color: theme("colors.gray.100");
+  }
+
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  .dark body {
+    color: theme("colors.dark-text-primary");
+    background-color: theme("colors.dark-primary");
+  }
+
+  /* Enable smooth scrolling on touch devices */
+  html {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Prevent pull-to-refresh on mobile */
+  body {
+    overscroll-behavior-y: contain;
+  }
+
+  /* Dark mode scrollbar styling */
+  .dark ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .dark ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .dark ::-webkit-scrollbar-thumb {
+    background-color: theme("colors.dark-tertiary");
+    border-radius: 3px;
+  }
+
+  .dark ::-webkit-scrollbar-thumb:hover {
+    background-color: theme("colors.dark-text-tertiary");
+  }
+
+  /* Firefox scrollbar for dark mode */
+  .dark * {
+    scrollbar-color: theme("colors.dark-tertiary") transparent;
+    scrollbar-width: thin;
+  }
+}
+
+/* Safe area utilities for mobile devices with notches/home indicators */
+@layer utilities {
+  /* Safe area insets */
+  .safe-area-inset {
+    padding-top: env(safe-area-inset-top);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+  }
+
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .safe-area-left {
+    padding-left: env(safe-area-inset-left);
+  }
+
+  .safe-area-right {
+    padding-right: env(safe-area-inset-right);
+  }
+
+  /*
+   * Top inset for the conversation header, once the workspace header above it
+   * is withdrawn (see conversation-chrome.ts).
+   *
+   * Height and padding live in one rule because they have to move together:
+   * `box-sizing: border-box` is global and the viewport opts into
+   * `viewport-fit=cover`, so an `h-14` bar with `padding-top:
+   * env(safe-area-inset-top)` keeps its 56px box and spends most of it on the
+   * notch. The inset is added to the bar height instead.
+   */
+  .conversation-header-inset {
+    padding-top: env(safe-area-inset-top);
+    height: calc(3.5rem + env(safe-area-inset-top));
+    min-height: calc(3.5rem + env(safe-area-inset-top));
+  }
+
+  @media (min-width: 48rem) {
+    .conversation-header-inset {
+      height: calc(3.75rem + env(safe-area-inset-top));
+      min-height: calc(3.75rem + env(safe-area-inset-top));
+    }
+  }
+
+  /*
+   * Bottom inset for the conversation column's last row (composer, lifecycle
+   * gate, assignment gate).
+   *
+   * `max()`, never a sum. Both insets describe the same strip of screen: the
+   * home indicator sits in the bottom 34px, and an open keyboard already
+   * covers that strip. Adding them shifts the composer a further 34px above a
+   * keyboard that is not there, which on iOS - where `env(safe-area-inset-
+   * bottom)` stays non-zero while VisualViewport reports the overlap - is the
+   * normal case rather than an edge case. Whichever is larger is the amount of
+   * screen actually unusable.
+   *
+   * Hand-written rather than an arbitrary Tailwind value so the nested
+   * `max(var(), env())` cannot be lost to class extraction; see
+   * conversation-chrome.ts for why that failure mode is taken seriously here.
+   */
+  .conversation-bottom-inset {
+    padding-bottom: max(
+      env(safe-area-inset-bottom),
+      var(--wa-keyboard-inset, 0px)
+    );
+  }
+
+  /* Touch manipulation for better touch response */
+  .touch-manipulation {
+    touch-action: manipulation;
+  }
+
+  /* Prevent text selection on touch interactions */
+  .select-none-touch {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  /* Smooth hardware-accelerated animations */
+  .gpu-accelerated {
+    transform: translateZ(0);
+    will-change: transform;
+  }
+
+  /* Hide scrollbar on mobile while keeping scroll functionality */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Tap highlight color for iOS */
+  .tap-transparent {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Screen reader only - visually hidden but accessible to screen readers */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+  }
+
+  /* Skip to main content link - visible only on focus for keyboard navigation */
+  .skip-link {
+    position: absolute;
+    top: -100%;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    padding: 0.75rem 1.5rem;
+    background-color: theme("colors.whatsapp-teal-green");
+    color: white;
+    font-weight: 600;
+    border-radius: 0 0 0.5rem 0.5rem;
+    text-decoration: none;
+    transition: top 0.2s ease-in-out;
+  }
+
+  .skip-link:focus {
+    top: 0;
+    outline: 2px solid theme("colors.whatsapp-green");
+    outline-offset: 2px;
+  }
+}
+
+/* Typing indicator animation */
+@keyframes typing-dots {
+  0%,
+  20% {
+    content: "";
+  }
+  40% {
+    content: ".";
+  }
+  60% {
+    content: "..";
+  }
+  80%,
+  100% {
+    content: "...";
+  }
+}
+
+.typing-indicator {
+  display: inline-flex;
+  align-items: center;
+}
+
+.typing-dots::after {
+  content: "";
+  animation: typing-dots 1.5s infinite;
+  width: 1em;
+  display: inline-block;
+}
+
+/* Side sheet entrance (notification sheet: full page on mobile, right-anchored on md+) */
+@keyframes sheet-slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes sheet-scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-sheet-in-right {
+  animation: sheet-slide-in-right 220ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.animate-scrim-in {
+  animation: sheet-scrim-in 180ms ease-out;
+}
+
+/* Respect user's preference for reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

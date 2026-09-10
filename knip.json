@@ -1,0 +1,41 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "workspaces": {
+    "apps/api": {
+      "entry": ["src/index.ts", "src/scripts/*.ts", "src/**/*.test.ts"],
+      "project": ["src/**/*.ts"],
+      "ignore": ["src/__tests__/**"],
+      "ignoreDependencies": ["pino-pretty"]
+    },
+    "apps/web": {
+      "entry": ["src/main.tsx", "src/**/*.test.ts"],
+      "project": ["src/**/*.{ts,tsx}"],
+      "ignore": ["e2e/**"]
+    },
+    "packages/database": {
+      "entry": [
+        "src/migrations/*.ts",
+        "src/**/*.test.ts",
+        "src/preflight-*.ts"
+      ],
+      "project": ["src/**/*.ts"]
+    },
+    "packages/shared": {
+      "entry": ["src/**/*.test.ts"],
+      "project": ["src/**/*.ts"]
+    },
+    "packages/ui": {
+      "project": ["src/**/*.{ts,tsx}"]
+    },
+    "services/orchestrator": {
+      "ignore": ["**/*.go"]
+    },
+    "services/whatsapp": {
+      "ignore": ["**/*.go"]
+    }
+  },
+  "ignoreDependencies": ["kysely", "pg", "ioredis"],
+  "ignoreBinaries": ["go"],
+  "ignoreExportsUsedInFile": true,
+  "exclude": ["duplicates", "enumMembers", "exports", "types", "unresolved"]
+}

@@ -1,0 +1,243 @@
+// Package handler implements WhatsApp event processing with robust media download handling.
+//
+// Media Download Retry Mechanism:
+//
+// All media downloads (images, videos, audio, documents, stickers) use exponential backoff
+// retry logic to handle transient network failures. The retry configuration is controlled
+// by package-level constants:
+//
+//   - mediaDownloadMaxRetries (4): Maximum number of total download attempts (initial + retries)
+//   - mediaDownloadBaseDelay (1s): Initial backoff, doubling each retry (1s, 2s, 4s)
+//   - mediaDownloadAttemptTimeout (30s): Per-attempt timeout to prevent indefinite blocking
+//
+// Retry Behavior:
+//  1. First attempt starts immediately with a 30s timeout
+//  2. On failure, waits 1s before second attempt (30s timeout)
+//  3. On failure, waits 2s before third attempt (30s timeout)
+//  4. On failure, waits 4s before fourth attempt (30s timeout)
+//  5. If all attempts fail, returns the last error
+//
+// Maximum additional delay: ~7 seconds (1s + 2s + 4s backoff)
+//
+// Context cancellation is checked before each attempt and during backoff delays,
+// allowing graceful shutdown when the service is stopping.
+//
+// Functions using retry logic:
+//   - handleMediaMessage: Real-time message media (timeout: 135s)
+//   - downloadHistoryMedia: History sync media (timeout: 75s)
+package handler
+
+import (
+	"context"
+	"log"
+	"sync"
+	"time"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	"golang.org/x/sync/singleflight"
+
+	natsClient "github.com/ygncode-lab/whatsapp-web/services/whatsapp/internal/nats"
+	"github.com/ygncode-lab/whatsapp-web/services/whatsapp/internal/storage"
+)
+
+// Number of parallel workers for history sync processing
+const historySyncWorkers = 10
+
+// historySyncIdleTimeout is a fallback for protocol variants that don't send a
+// final RECENT chunk. Normal initial syncs complete immediately when the final
+// chunk reaches 100%; this timeout only prevents an orphaned sync lifecycle.
+const historySyncIdleTimeout = 2 * time.Minute
+
+// Media download retry configuration constants.
+const (
+	// mediaDownloadMaxRetries is the maximum number of total attempts (initial + retries)
+	// for media downloads. 4 attempts allow for 3 backoff intervals (1s, 2s, 4s).
+	mediaDownloadMaxRetries = 4
+
+	// mediaDownloadBaseDelay is the initial delay between retry attempts.
+	// Subsequent delays follow exponential backoff: 1s, 2s, 4s.
+	mediaDownloadBaseDelay = 1 * time.Second
+
+	// mediaDownloadAttemptTimeout is the timeout for each individual download attempt.
+	mediaDownloadAttemptTimeout = 30 * time.Second
+)
+
+// WhatsAppClient defines the interface for the WhatsApp client.
+// This allows for mocking the client in tests.
+type WhatsAppClient interface {
+	DownloadMedia(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
+	GetClient() *whatsmeow.Client
+	HandleReconnect(ctx context.Context)
+	SendPresence(ctx context.Context, state types.Presence) error
+	SubscribePresence(ctx context.Context, jid types.JID) error
+	BlockContact(ctx context.Context, jid string) error
+	UnblockContact(ctx context.Context, jid string) error
+}
+
+// SyncStatusPublisher is the small part of the event publisher used by the
+// history-sync lifecycle. Keeping it separate makes lifecycle ordering directly
+// testable without a running NATS server.
+type SyncStatusPublisher interface {
+	PublishSyncStatus(status string, messageCount int, conversations int) error
+}
+
+type HistoryPagePublisher interface {
+	PublishHistorySyncPage(chatJID string, messageCount int, status string) error
+}
+
+// Config holds handler configuration.
+type Config struct {
+	WorkerID             string
+	CompanyID            string
+	ConnectionID         string
+	NATSUrl              string
+	Client               WhatsAppClient
+	Publisher            *natsClient.Publisher
+	SyncStatusPublisher  SyncStatusPublisher
+	HistoryPagePublisher HistoryPagePublisher
+	Storage              *storage.Client
+	Ctx                  context.Context
+}
+
+// Handler processes WhatsApp events.
+type Handler struct {
+	publishMessage       func(natsClient.MessageEvent) error
+	config               Config
+	publisher            *natsClient.Publisher
+	syncStatusPublisher  SyncStatusPublisher
+	historyPagePublisher HistoryPagePublisher
+
+	historySyncMu            sync.Mutex
+	historySyncActive        bool
+	historySyncMessages      int
+	historySyncConversations int
+	historySyncActivity      uint64
+	historySyncTimer         *time.Timer
+	historySyncIdleTimeout   time.Duration
+
+	profilePictureCache    sync.Map
+	profilePictureRequests singleflight.Group
+	// fetchProfilePictureFn overrides the WhatsApp/storage round trip in tests.
+	fetchProfilePictureFn func(types.JID) (string, error)
+
+	// Group refreshes are coalesced per group and capped in total, so a burst
+	// of group changes cannot turn into a burst of concurrent WhatsApp queries.
+	groupRefreshMu      sync.Mutex
+	groupRefreshPending map[string]bool
+	groupRefreshSlots   chan struct{}
+	// refreshGroupFn overrides the WhatsApp round trip in tests.
+	refreshGroupFn func(types.JID)
+
+	// Group metadata syncs are connection-scoped. A new Connected event cancels
+	// the previous sync, while the heavier LID directory repair runs at most once
+	// during a worker process lifetime.
+	groupSyncMu              sync.Mutex
+	groupSyncCancel          context.CancelFunc
+	groupLIDRepairStarted    bool
+	groupLIDRepairInProgress bool
+
+	// Album parents declare the total media count while each child carries the
+	// parent ID and tile index. Keep that short-lived manifest in memory so the
+	// child event can preserve both pieces without storing a protocol-only row.
+	mediaAlbumMu        sync.Mutex
+	mediaAlbumManifests map[string]mediaAlbumManifest
+}
+
+// maxConcurrentGroupRefreshes bounds how many group metadata reads are in
+// flight at once. Each is a WhatsApp IQ with a 30-second timeout; a handful is
+// enough to keep a busy workspace current without flooding the connection.
+const maxConcurrentGroupRefreshes = 4
+
+// New creates a new message handler.
+func New(cfg Config) *Handler {
+	syncPublisher := cfg.SyncStatusPublisher
+	if syncPublisher == nil && cfg.Publisher != nil {
+		syncPublisher = cfg.Publisher
+	}
+	historyPagePublisher := cfg.HistoryPagePublisher
+	if historyPagePublisher == nil && cfg.Publisher != nil {
+		historyPagePublisher = cfg.Publisher
+	}
+	h := &Handler{
+		config:                 cfg,
+		publisher:              cfg.Publisher,
+		syncStatusPublisher:    syncPublisher,
+		historyPagePublisher:   historyPagePublisher,
+		historySyncIdleTimeout: historySyncIdleTimeout,
+		groupRefreshPending:    make(map[string]bool),
+		groupRefreshSlots:      make(chan struct{}, maxConcurrentGroupRefreshes),
+		mediaAlbumManifests:    make(map[string]mediaAlbumManifest),
+	}
+	if cfg.Publisher != nil {
+		h.publishMessage = cfg.Publisher.PublishMessage
+	}
+	return h
+}
+
+// HandleEventWithSuccessStatus acknowledges live messages only after persistence.
+func (h *Handler) HandleEventWithSuccessStatus(evt interface{}) bool {
+	if msg, ok := evt.(*events.Message); ok {
+		if err := h.handleMessage(msg); err != nil {
+			log.Printf("Incoming message retained for replay: %v", err)
+			return false
+		}
+		return true
+	}
+	h.HandleEvent(evt)
+	return true
+}
+
+// HandleEvent processes incoming WhatsApp events.
+func (h *Handler) HandleEvent(evt interface{}) {
+	switch v := evt.(type) {
+	case *events.Message:
+		h.handleMessage(v)
+	case *events.Receipt:
+		h.handleReceipt(v)
+	case *events.Presence:
+		h.handlePresence(v)
+	case *events.ChatPresence:
+		h.handleChatPresence(v)
+	case *events.Connected:
+		h.handleConnected(v)
+	case *events.Disconnected:
+		h.handleDisconnected(v)
+	case *events.LoggedOut:
+		h.handleLoggedOut(v)
+	case *events.QR:
+		h.handleQR(v)
+	case *events.PairSuccess:
+		h.handlePairSuccess(v)
+	case *events.HistorySync:
+		h.handleHistorySync(v)
+	case *events.Contact:
+		h.handleContactName(v)
+	case *events.AppState:
+		h.handleLIDContactAction(v)
+	case *events.PushName:
+		h.handlePushName(v)
+	case *events.BusinessName:
+		h.handleBusinessName(v)
+	case *events.AppStateSyncComplete:
+		if v.Name == appstate.WAPatchCriticalUnblockLow {
+			go h.syncKnownContactNames()
+		}
+	case *events.StreamReplaced:
+		h.handleStreamReplaced(v)
+	case *events.Picture:
+		h.handlePicture(v)
+	case *events.GroupInfo:
+		h.handleGroupInfo(v)
+	case *events.JoinedGroup:
+		h.handleJoinedGroup(v)
+	case *events.OfflineSyncPreview:
+		h.handleOfflineSyncPreview(v)
+	case *events.OfflineSyncCompleted:
+		h.handleOfflineSyncCompleted(v)
+	default:
+		// Ignore other events silently
+	}
+}

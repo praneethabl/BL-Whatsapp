@@ -1,0 +1,9 @@
+{
+  "name": "@blwhatsappcopy/whatsapp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "go build -o whatsapp-worker.next main.go && mv whatsapp-worker.next whatsapp-worker",
+    "clean": "rm -f whatsapp-worker whatsapp-worker.next"
+  }
+}

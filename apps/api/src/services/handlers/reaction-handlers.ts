@@ -1,0 +1,185 @@
+/**
+ * Reaction and message revoke event handlers
+ */
+
+import { toDbDate } from "@blwhatsappcopy/shared";
+import { formatError } from "../../lib/logger.js";
+import { loadMessageReactions } from "../../lib/message-reactions.js";
+import type {
+  MessageRevokeEvent,
+  ReactionEvent,
+} from "../../lib/nats/index.js";
+import { broadcastToContactViewers } from "../message-broadcast.service.js";
+import { getTenantConnection } from "../tenant.service.js";
+import { lockActiveConnectionForEvent } from "./connection-event-guard.js";
+import { handlerLogger as logger } from "./types.js";
+
+/**
+ * Handles reaction events from WhatsApp
+ * Stores reactions in database and broadcasts to realtime clients
+ */
+export async function handleReactionEvent(event: ReactionEvent): Promise<void> {
+  const { companyId, connectionId, payload } = event;
+
+  logger.debug(
+    {
+      companyId,
+      from: payload.from,
+      emoji: payload.emoji || "(removed)",
+      messageId: payload.messageId,
+    },
+    "Reaction event received",
+  );
+
+  try {
+    // Get database connection
+    const tenantDb = getTenantConnection(companyId);
+
+    const message = await tenantDb.transaction().execute(async (trx) => {
+      if (!(await lockActiveConnectionForEvent(trx, connectionId))) return null;
+      // Find the message being reacted to (by WhatsApp message_id field, not the internal id)
+      const stored = await trx
+        .selectFrom("messages")
+        .select(["id", "contact_id", "whatsapp_connection_id"])
+        .where("message_id", "=", payload.messageId)
+        .where("whatsapp_connection_id", "=", connectionId)
+        .executeTakeFirst();
+      if (!stored) return null;
+
+      if (payload.emoji) {
+        await trx
+          .insertInto("message_reactions")
+          .values({
+            message_id: stored.id,
+            reactor_jid: payload.from,
+            emoji: payload.emoji,
+          })
+          .onConflict((oc) =>
+            oc.columns(["message_id", "reactor_jid"]).doUpdateSet({
+              emoji: payload.emoji,
+            }),
+          )
+          .execute();
+      } else {
+        await trx
+          .deleteFrom("message_reactions")
+          .where("message_id", "=", stored.id)
+          .where("reactor_jid", "=", payload.from)
+          .execute();
+      }
+      return stored;
+    });
+
+    if (!message) {
+      logger.warn(
+        { messageId: payload.messageId },
+        "Message not found for reaction on an active connection",
+      );
+      return;
+    }
+
+    const reactionDetails = payload.emoji
+      ? (await loadMessageReactions(tenantDb, [message]))
+          .get(message.id)
+          ?.find((reaction) => reaction.reactorJid === payload.from)
+      : undefined;
+
+    // Broadcast to clients
+    await broadcastToContactViewers(
+      companyId,
+      message.contact_id,
+      "message:reaction",
+      {
+        messageId: message.id, // Use internal message ID
+        contactId: message.contact_id, // Use contact_id instead of conversationId
+        from: payload.from,
+        emoji: payload.emoji,
+        reactorPhoneNumber: reactionDetails?.reactorPhoneNumber,
+        reactorName: reactionDetails?.reactorName,
+        reactorAvatarUrl: reactionDetails?.reactorAvatarUrl,
+        isOwn: reactionDetails?.isOwn,
+        timestamp: payload.timestamp,
+      },
+      { connectionId },
+    );
+  } catch (error) {
+    logger.error(formatError(error), "Error handling reaction event");
+    throw error;
+  }
+}
+
+/**
+ * Handles message revoke (deletion) events from WhatsApp
+ * When a user deletes a message for everyone, this updates the database
+ * and notifies realtime clients
+ */
+export async function handleMessageRevokeEvent(
+  event: MessageRevokeEvent,
+): Promise<void> {
+  const { companyId, connectionId, payload } = event;
+
+  logger.debug(
+    { companyId, connectionId, messageId: payload.messageId },
+    "Message revoke received",
+  );
+
+  try {
+    const tenantDb = getTenantConnection(companyId);
+
+    // Update the message to mark it as deleted by sender
+    const result = await tenantDb
+      .updateTable("messages")
+      .set({
+        deleted_by_sender: true,
+        deleted_at: toDbDate(),
+      })
+      .where("message_id", "=", payload.messageId)
+      .where("whatsapp_connection_id", "=", connectionId)
+      .executeTakeFirst();
+
+    if (result.numUpdatedRows > 0) {
+      logger.debug(
+        {
+          messageId: payload.messageId,
+          rowsAffected: result.numUpdatedRows.toString(),
+        },
+        "Marked message as deleted",
+      );
+
+      // Get the message to find the contact_id for broadcasting
+      const message = await tenantDb
+        .selectFrom("messages")
+        .select(["id", "contact_id"])
+        .where("message_id", "=", payload.messageId)
+        .where("whatsapp_connection_id", "=", connectionId)
+        .executeTakeFirst();
+
+      if (message) {
+        // Broadcast to clients
+        await broadcastToContactViewers(
+          companyId,
+          message.contact_id,
+          "message:deleted",
+          {
+            messageId: message.id,
+            conversationId: message.contact_id,
+            whatsappMessageId: payload.messageId,
+          },
+          { connectionId },
+        );
+      }
+    } else {
+      // Message not found - this could happen if:
+      // 1. The message was never stored in our database (race condition)
+      // 2. The message was already deleted
+      // Log a warning but don't throw - this is expected in some edge cases
+      logger.warn(
+        { messageId: payload.messageId },
+        "Message not found for revoke - may be race condition or never stored",
+      );
+    }
+  } catch (error) {
+    logger.error(formatError(error), "Failed to handle message revoke");
+    throw error;
+  }
+}

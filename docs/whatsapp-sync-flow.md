@@ -1,0 +1,97 @@
+# WhatsApp Synchronization Flow
+
+## Initial history sync
+
+1. A connected whatsmeow worker receives history-sync batches from WhatsApp.
+2. The worker normalizes contacts, conversations, messages, media metadata, and receipts.
+3. Durable events are written to a connection-scoped PostgreSQL outbox, then
+   published to NATS with a stable JetStream message ID. Pending rows replay
+   after NATS or worker recovery; expiring QR, presence, and typing signals are
+   not replayed.
+4. The Bun API consumes the events and writes them to the correct tenant schema.
+5. Message uniqueness constraints make redelivery safe.
+6. Searchable records are indexed in Meilisearch.
+7. The worker opens the lifecycle on the first tracked history chunk, aggregates progress across bootstrap/full/recent chunks, and completes only after the final `RECENT` chunk reaches 100%. WhatsApp's separate offline catch-up events do not control history-sync state. A two-minute inter-chunk idle fallback closes protocol variants that omit the final marker.
+8. The API persists cumulative message/conversation counters on the connection and publishes progress through Centrifugo (`sync:start`, `sync:progress`, `sync:complete`, or `sync:interrupted`).
+9. React displays sync state, rejects progress without an active start, restores persisted counters after refresh, polls PostgreSQL while syncing, and invalidates chat queries when synchronization completes.
+
+## Live messages
+
+```text
+WhatsApp
+  -> Go event handler
+  -> optional R2/MinIO media upload
+  -> PostgreSQL worker event outbox
+  -> NATS JetStream
+  -> API validation and tenant persistence
+  -> Meilisearch indexing
+  -> Centrifugo message:new
+  -> React Query message cache and ephemeral Zustand UI state
+```
+
+Outgoing messages take the reverse command path: REST API -> atomic tenant persistence and command outbox -> NATS command -> worker -> WhatsApp. Delivery receipts return through the durable event path and produce `message:status` updates.
+
+## Loading older history on demand
+
+When local database pagination reaches the oldest imported message, the chat UI
+can request another page from the primary WhatsApp device:
+
+1. `POST /api/conversations/:id/history` locks the conversation, verifies its
+   connection is active, and uses the oldest persisted WhatsApp message as the
+   request anchor.
+2. A `request_history` command is committed to the session-scoped command
+   outbox. The worker asks the primary device for up to 50 messages immediately
+   before that anchor.
+3. WhatsApp returns an `ON_DEMAND` history sync. The existing history importer
+   persists its messages and reactions; media is kept as deferred metadata so
+   the page is not blocked by attachment downloads.
+4. After those message events are durably queued, the worker publishes
+   `history_sync_page`, including whether more history remains, the beginning
+   was reached, or the primary device denied access.
+5. The API persists that per-conversation state and broadcasts
+   `history:loaded`. The requesting browser fetches the newly inserted database
+   page and prepends it without resetting the already loaded thread.
+
+### Outgoing media transport
+
+1. `/api/media/upload` validates the file and writes it below `media/{companyId}/` in S3/R2/MinIO.
+2. The send endpoint resolves the API-issued URL to that tenant-prefixed key and uses `HeadObject` to validate MIME type, filename, size (maximum 50 MiB), and SHA-256 metadata.
+3. The NATS command contains only the object key and validated metadata; it never contains media bytes or an arbitrary client URL.
+4. The owning WhatsApp worker verifies the tenant prefix, streams the object with the same size cap, verifies its checksum, and passes the bytes directly to whatsmeow.
+
+This keeps realistic documents below the default NATS payload limit and avoids the previous S3 → API → PostgreSQL outbox → NATS byte-array copy.
+
+## Deferred media
+
+The worker retains each attachment's encrypted direct path, key, and hashes
+before attempting the eager download. If that download fails, the message is
+stored as pending; the UI can request it later, and the API publishes
+`media:downloaded` or `media:download_failed` after updating the message.
+
+## Delivery guarantees
+
+- Durable JetStream consumers with explicit acknowledgements provide at-least-once event delivery.
+- The worker event outbox closes the worker/NATS outage and restart window;
+  JetStream message IDs make replay safe.
+- Tenant-local command outboxes close the database/NATS crash window and use JetStream message IDs for deduplication.
+- Workers persist successful and terminally failed command results by
+  `command_id` before ACK. Redelivery republishes that result instead of
+  repeating the WhatsApp side effect; extra deliveries are reserved for result
+  publication and never repeat the send.
+- Invalid or exhausted API events are persisted in the separate
+  `WHATSAPP_DEAD_LETTERS` stream before their source message is terminated.
+- The worker claims a write-ahead send intent before invoking WhatsApp. A crash after that claim but before the terminal result is persisted is reported as an unknown outcome and surfaced in the inbox as "Delivery unconfirmed"; the command is acknowledged and a later receipt can still settle it by durable ID (see `docs/operations/message-delivery.md`).
+- Database uniqueness constraints deduplicate WhatsApp message IDs and reactions.
+- PostgreSQL is the source of truth; Centrifugo is a realtime update signal.
+- Clients refetch affected queries after reconnect or sync completion.
+
+## Main files
+
+| Area | File |
+| --- | --- |
+| Worker history sync | `services/whatsapp/internal/handler/history_sync.go` |
+| Worker event outbox | `services/whatsapp/internal/nats/publisher.go` |
+| API NATS consumer | `apps/api/src/services/message-handler.ts` |
+| Message handlers | `apps/api/src/services/handlers/message-handlers.ts` |
+| Realtime provider | `apps/web/src/contexts/RealtimeProvider.tsx` |
+| Database constraints | `packages/database/src/migrations/` |

@@ -1,0 +1,140 @@
+import { describe, expect, test } from "bun:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import {
+  LinkifiedText,
+  parseMessageLinks,
+  resolveMentionNames,
+} from "./LinkifiedText";
+
+describe("message linkification", () => {
+  test("is used for text messages and media captions", async () => {
+    const messageContent = await Bun.file(
+      new URL("./MessageContent.tsx", import.meta.url),
+    ).text();
+    expect(messageContent).toContain("text={message.content}");
+    expect(messageContent).toContain("text={mediaCaption}");
+  });
+
+  test("linkifies full, www, and bare-domain URLs", () => {
+    const segments = parseMessageLinks(
+      "See https://example.com/a, www.example.org and docs.example.net/path",
+    );
+    expect(segments.filter((segment) => segment.type === "link")).toEqual([
+      {
+        type: "link",
+        value: "https://example.com/a",
+        href: "https://example.com/a",
+      },
+      {
+        type: "link",
+        value: "www.example.org",
+        href: "https://www.example.org/",
+      },
+      {
+        type: "link",
+        value: "docs.example.net/path",
+        href: "https://docs.example.net/path",
+      },
+    ]);
+  });
+
+  test("keeps sentence punctuation outside the clickable URL", () => {
+    const segments = parseMessageLinks("Open (https://example.com/test). Now");
+    expect(segments).toContainEqual({
+      type: "link",
+      value: "https://example.com/test",
+      href: "https://example.com/test",
+    });
+    expect(segments).toContainEqual({ type: "text", value: ")." });
+  });
+
+  test("does not treat an @ inside a URL as an email address", () => {
+    const tiktokUrl =
+      "https://www.tiktok.com/@thesgdaily/video/7666820732684438805";
+    expect(parseMessageLinks(tiktokUrl)).toEqual([
+      {
+        type: "link",
+        value: tiktokUrl,
+        href: tiktokUrl,
+      },
+    ]);
+  });
+
+  test("linkifies email addresses without allowing script protocols", () => {
+    expect(parseMessageLinks("Email team@example.com")).toContainEqual({
+      type: "link",
+      value: "team@example.com",
+      href: "mailto:team@example.com",
+    });
+    expect(
+      parseMessageLinks("javascript:alert(1)").some(
+        (segment) => segment.type === "link",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("WhatsApp mention display names", () => {
+  const participants = [
+    {
+      jid: "98797300309@s.whatsapp.net",
+      phoneNumber: "98797300309",
+      mentionIds: ["98797300309", "83185010536598"],
+      displayName: "Kelvin Cheng",
+    },
+  ];
+
+  test("replaces a raw phone mention with the participant name", () => {
+    expect(
+      resolveMentionNames("@98797300309 https://wall-pets.com/", participants),
+    ).toBe("@Kelvin Cheng https://wall-pets.com/");
+  });
+
+  test("supports cached participant data from before mention aliases existed", () => {
+    expect(
+      resolveMentionNames("@98797300309 hello", [
+        {
+          jid: "98797300309@s.whatsapp.net",
+          phoneNumber: "98797300309",
+          displayName: "Kelvin Cheng",
+        },
+      ]),
+    ).toBe("@Kelvin Cheng hello");
+  });
+
+  test("replaces a private LID mention with the mapped participant name", () => {
+    expect(
+      resolveMentionNames(
+        "@83185010536598 did you spend the afternoon?",
+        participants,
+      ),
+    ).toBe("@Kelvin Cheng did you spend the afternoon?");
+  });
+
+  test("keeps an unknown mention unchanged", () => {
+    expect(resolveMentionNames("@123456789 hello", participants)).toBe(
+      "@123456789 hello",
+    );
+  });
+});
+
+test("group mentions render as escaped text, never email or external links", () => {
+  for (const groupMentions of [
+    [],
+    [{ jid: "120363000000000001@g.us", subject: "<script>Bad</script>" }],
+  ]) {
+    const html = renderToStaticMarkup(
+      createElement(LinkifiedText, {
+        text: "@120363000000000001@g.us to RSVP ^^",
+        isOwn: false,
+        groupMentions,
+      }),
+    );
+    expect(html).not.toContain("href=");
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("to RSVP ^^");
+    if (groupMentions.length)
+      expect(html).toContain("@&lt;script&gt;Bad&lt;/script&gt;");
+  }
+});

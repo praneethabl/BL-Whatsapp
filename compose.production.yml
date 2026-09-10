@@ -1,0 +1,501 @@
+name: ${COMPOSE_PROJECT_NAME:-blwhatsappcopy-production}
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: local
+    options:
+      max-size: 20m
+      max-file: "5"
+
+x-app-environment: &app-environment
+  NODE_ENV: production
+  POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+  POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+  NATS_SERVICE_PASSWORD_FILE: /run/secrets/nats_service_password
+  # R2 S3 API endpoint, not an R2 public/custom domain. The bucket remains private.
+  S3_ENDPOINT: ${S3_ENDPOINT:?set R2 S3 endpoint}
+  S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
+  S3_REGION: ${S3_REGION:-auto}
+  S3_FORCE_PATH_STYLE: "true"
+  S3_LEGACY_ENDPOINTS: ${S3_LEGACY_ENDPOINTS:-}
+  S3_SIGNED_URL_TTL_SECONDS: ${S3_SIGNED_URL_TTL_SECONDS:-300}
+  STORAGE_CREATE_BUCKET_IF_MISSING: "false"
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+services:
+  proxy:
+    <<: *service-defaults
+    image: caddy:2.10.0-alpine
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./infrastructure/production/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge:
+        ipv4_address: ${PROXY_IP:-10.253.0.254}
+    depends_on:
+      api-router:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+      centrifugo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    <<: *service-defaults
+    image: blwhatsappcopy/web:${APP_IMAGE_TAG:?set APP_IMAGE_TAG}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: web
+      args:
+        VITE_API_URL: /api
+        VITE_CENTRIFUGO_URL: wss://${APP_DOMAIN:?set APP_DOMAIN}/connection/websocket
+        VITE_VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+        # Optional GA4 product analytics (see docs/product-analytics.md).
+        VITE_GA_ENABLED: ${VITE_GA_ENABLED:-false}
+        VITE_GA_MEASUREMENT_ID: ${VITE_GA_MEASUREMENT_ID:-}
+        VITE_GA_REQUIRE_CONSENT: ${VITE_GA_REQUIRE_CONSENT:-true}
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Stable internal load balancer for horizontally scaled API containers.
+  # HAProxy discovers every `api` service address through Docker DNS and sends
+  # traffic only to replicas whose readiness endpoint succeeds.
+  api-router:
+    <<: *service-defaults
+    image: haproxy:3.1.8-alpine
+    volumes:
+      - ./infrastructure/production/haproxy-api.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      edge: {}
+      backend:
+        ipv4_address: ${API_ROUTER_IP:-10.254.0.254}
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4451/api/health/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+  migration:
+    <<: *service-defaults
+    restart: "no"
+    image: blwhatsappcopy/migration:${APP_IMAGE_TAG:?set APP_IMAGE_TAG}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: migration
+    environment:
+      NODE_ENV: production
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs: [/tmp]
+
+  worker-artifact-installer:
+    <<: *service-defaults
+    restart: "no"
+    image: blwhatsappcopy/whatsapp-worker-artifact:${WORKER_IMAGE_TAG:-${APP_IMAGE_TAG:?set APP_IMAGE_TAG}}
+    build:
+      context: .
+      dockerfile: services/whatsapp/Dockerfile
+      target: artifact-installer
+    environment:
+      # Empty means derive immutable identity from the packaged SHA-256. This is
+      # safe when an existing deployment script rebuilds a mutable image tag.
+      WORKER_ARTIFACT_VERSION: ${WORKER_ARTIFACT_VERSION:-}
+    volumes:
+      - whatsapp_worker_artifacts:/var/lib/blwhatsappcopy/worker-artifacts
+    network_mode: none
+    read_only: true
+    tmpfs: [/tmp]
+
+  api:
+    <<: *service-defaults
+    image: blwhatsappcopy/api:${APP_IMAGE_TAG:?set APP_IMAGE_TAG}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: api
+    environment:
+      <<: *app-environment
+      # secret-entrypoint derives the credential-bearing service URL from the
+      # root-only nats_service_password mount.
+      PORT: "4445"
+      APP_URL: https://${APP_DOMAIN:?set APP_DOMAIN}
+      CORS_ORIGINS: https://${APP_DOMAIN:?set APP_DOMAIN}
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      JWT_ACCESS_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      MAIL_DRIVER: ${MAIL_DRIVER:?set MAIL_DRIVER}
+      # The selected provider's key arrives through the provider-neutral
+      # mail_api_key mount, and only the provider whose host key file is
+      # configured names it. The unused provider therefore needs no placeholder
+      # secret, and no provider's key is ever mounted under another's name.
+      RESEND_API_KEY_FILE: ${RESEND_API_KEY_FILE:+/run/secrets/mail_api_key}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_EMAIL_API_TOKEN_FILE: ${CLOUDFLARE_EMAIL_API_TOKEN_FILE:+/run/secrets/mail_api_key}
+      EMAIL_FROM: ${EMAIL_FROM:?set EMAIL_FROM}
+      FEEDBACK_TO_EMAIL: ${FEEDBACK_TO_EMAIL:?set FEEDBACK_TO_EMAIL}
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY_FILE: /run/secrets/meilisearch_master_key
+      CENTRIFUGO_API_URL: http://centrifugo:8000/api
+      CENTRIFUGO_HEALTH_URL: http://centrifugo:8000/health
+      CENTRIFUGO_API_KEY_FILE: /run/secrets/centrifugo_api_key
+      CENTRIFUGO_TOKEN_HMAC_SECRET_FILE: /run/secrets/centrifugo_token_secret
+      CENTRIFUGO_REQUEST_TIMEOUT_MS: "3000"
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      LOG_PRETTY: "false"
+      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_STORE_TYPE: ${RATE_LIMIT_STORE_TYPE:-postgres}
+      RATE_LIMIT_POSTGRES_CLEANUP_INTERVAL_SECONDS: ${RATE_LIMIT_POSTGRES_CLEANUP_INTERVAL_SECONDS:-60}
+      RATE_LIMIT_POSTGRES_CLEANUP_BATCH_SIZE: ${RATE_LIMIT_POSTGRES_CLEANUP_BATCH_SIZE:-1000}
+      API_REPLICA_COUNT: ${API_REPLICA_COUNT:-1}
+      PUBLIC_DB_POOL_MAX: ${PUBLIC_DB_POOL_MAX:-5}
+      TENANT_DB_POOL_MAX: ${TENANT_DB_POOL_MAX:-10}
+      # Cross-process membership invalidation is not yet enabled. Zero keeps a
+      # permission revocation authoritative on the next event in every replica.
+      REALTIME_MEMBERSHIP_CACHE_TTL_MS: ${REALTIME_MEMBERSHIP_CACHE_TTL_MS:-0}
+      # The API's only HTTP peer is HAProxy; Caddy and cloud-control are
+      # earlier hops whose verified address chain HAProxy appends to.
+      TRUSTED_PROXY_IPS: ${API_ROUTER_IP:-10.254.0.254}
+      TRUSTED_PROXY_IP_HEADER: x-forwarded-for
+    secrets:
+      - postgres_password
+      - nats_service_password
+      - s3_access_key
+      - s3_secret_key
+      - jwt_secret
+      - mail_api_key
+      - meilisearch_master_key
+      - centrifugo_api_key
+      - centrifugo_token_secret
+    networks: [backend, data]
+    deploy:
+      replicas: ${API_REPLICA_COUNT:-1}
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      centrifugo:
+        condition: service_healthy
+    read_only: true
+    tmpfs: [/tmp]
+    # apps/api/src/index.ts drains the HTTP server, stops its dispatchers, then
+    # releases NATS and the database pools under a single 20s budget and exits.
+    # Docker's 10s default would SIGKILL partway through that. Keep this above
+    # SHUTDOWN_DEADLINE_MS in apps/api/src/index.ts; the guard test in
+    # apps/api/src/lib/shutdown-config.test.ts holds the two together.
+    stop_grace_period: 30s
+    healthcheck:
+      # Compose/deployment health must represent readiness for every replica;
+      # HAProxy performs the same check before routing application traffic.
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:4445/api/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  orchestrator:
+    <<: *service-defaults
+    image: blwhatsappcopy/orchestrator:${APP_IMAGE_TAG:?set APP_IMAGE_TAG}
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+      target: orchestrator
+    environment:
+      <<: *app-environment
+      # Operational endpoints remain process-local; they are not routed by Caddy.
+      # Root-only authority is generated afresh into tmpfs at container start.
+      # Operators read it through docker exec as root; workers run under unique
+      # unprivileged UIDs and cannot read this file or the manager environment.
+      HTTP_ADDR: 127.0.0.1:8080
+      EPHEMERAL_HTTP_BEARER_TOKEN_FILE: /run/blwhatsappcopy-control/http-bearer-token
+      ORCHESTRATOR_ROOT_MANAGER_APPROVED: "true"
+      WORKER_POSTGRES_PASSWORD_FILE: /run/secrets/worker_postgres_password
+      NATS_WORKER_PASSWORD_FILE: /run/secrets/nats_worker_password
+      # Bootstrap/default is tied to the application release, not the independently
+      # staged WORKER_IMAGE_TAG. A WhatsApp-only image change therefore recreates
+      # only the installer; completed rollout history supplies later defaults.
+      WORKER_ARTIFACT_ROOT: /var/lib/blwhatsappcopy/worker-artifacts
+      WORKER_DEFAULT_ARTIFACT_VERSION: ${WORKER_BOOTSTRAP_ARTIFACT_VERSION:-bootstrap}
+      WHATSAPP_BINARY_PATH: /var/lib/blwhatsappcopy/worker-artifacts/${WORKER_BOOTSTRAP_ARTIFACT_VERSION:-bootstrap}/whatsapp-worker
+      WORKER_ROLLOUT_READY_TIMEOUT: ${WORKER_ROLLOUT_READY_TIMEOUT:-2m}
+      HEALTH_CHECK_INTERVAL: 30s
+      AUTO_RESTART_ENABLED: "true"
+      AUTO_RESTART_MAX_RETRIES: "5"
+      AUTO_RESTART_BACKOFF: 5s
+      ORCHESTRATOR_MAX_WORKERS: ${ORCHESTRATOR_MAX_WORKERS:-15}
+      # Stable node identity for durable worker ownership and per-node command
+      # routing. Must not change across restarts of the same instance; each
+      # additional orchestrator instance needs its own distinct value.
+      ORCHESTRATOR_NODE_ID: ${ORCHESTRATOR_NODE_ID:-node-1}
+      # Fleet-wide connection ceiling enforced atomically in the registry
+      # claim across all nodes; ORCHESTRATOR_MAX_WORKERS stays per-host.
+      ORCHESTRATOR_FLEET_MAX_CONNECTIONS: ${ORCHESTRATOR_FLEET_MAX_CONNECTIONS:-15}
+      # Node lease TTL and how long past expiry a peer waits before taking
+      # over a failed node's connections. The margin must exceed the fencing
+      # detection interval plus the worker stop budget.
+      ORCHESTRATOR_NODE_LEASE_DURATION: ${ORCHESTRATOR_NODE_LEASE_DURATION:-60s}
+      ORCHESTRATOR_NODE_TAKEOVER_MARGIN: ${ORCHESTRATOR_NODE_TAKEOVER_MARGIN:-60s}
+      WORKER_DB_MAX_OPEN_CONNS: ${WORKER_DB_MAX_OPEN_CONNS:-}
+      WORKER_DB_MAX_IDLE_CONNS: ${WORKER_DB_MAX_IDLE_CONNS:-}
+      WORKER_DB_CONN_MAX_LIFETIME: ${WORKER_DB_CONN_MAX_LIFETIME:-}
+      WORKER_DB_CONN_MAX_IDLE_TIME: ${WORKER_DB_CONN_MAX_IDLE_TIME:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    secrets:
+      - postgres_password
+      - nats_service_password
+      - nats_worker_password
+      - worker_postgres_password
+      - s3_access_key
+      - s3_secret_key
+    networks: [backend, data]
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      worker-artifact-installer:
+        condition: service_completed_successfully
+      worker-credential-provisioner:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+    volumes:
+      - whatsapp_worker_artifacts:/var/lib/blwhatsappcopy/worker-artifacts:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/blwhatsappcopy-control:mode=0700,uid=0,gid=0
+    # The orchestrator allows itself 30s to shut down: it records recovery intent
+    # for every worker, then stops each WhatsApp child process, allowing 5s per
+    # worker before escalating to SIGKILL. Docker's 10s default would SIGKILL the
+    # orchestrator partway through that, leaving the surviving workers' durable
+    # records untouched so the next process reads them as crashes and reports a
+    # WhatsApp failure that never happened. Keep this above the 30s budget in
+    # services/orchestrator/main.go; the guard test in
+    # services/orchestrator/internal/manager/stop_grace_period_test.go holds the
+    # two together.
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  worker-credential-provisioner:
+    <<: *service-defaults
+    image: postgres:18.1-alpine
+    restart: "no"
+    entrypoint: ["/bin/sh", "/usr/local/bin/provision-worker-role"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      WORKER_POSTGRES_PASSWORD_FILE: /run/secrets/worker_postgres_password
+    secrets:
+      - postgres_password
+      - worker_postgres_password
+    volumes:
+      - ./infrastructure/postgres/provision-worker-role.sh:/usr/local/bin/provision-worker-role:ro
+    networks: [data]
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs: [/tmp]
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:18.1-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks: [data]
+    shm_size: 256mb
+    stop_grace_period: 1m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    <<: *service-defaults
+    image: nats:2.10.26-alpine
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        /usr/local/bin/render-nats-config
+        exec nats-server --config /tmp/nats.conf
+    environment:
+      NATS_SERVICE_PASSWORD_FILE: /run/secrets/nats_service_password
+      NATS_WORKER_PASSWORD_FILE: /run/secrets/nats_worker_password
+    secrets:
+      - nats_service_password
+      - nats_worker_password
+    volumes:
+      - nats_data:/data
+      - ./infrastructure/nats/render-config.sh:/usr/local/bin/render-nats-config:ro
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  centrifugo:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: infrastructure/centrifugo/Dockerfile
+    image: blwhatsappcopy/centrifugo:v6.9.1-redacted
+    entrypoint: ["/usr/local/bin/centrifugo-secret-entrypoint"]
+    command: ["centrifugo", "--config=/centrifugo/config.json"]
+    environment:
+      CENTRIFUGO_NATS_PASSWORD_FILE: /run/secrets/nats_service_password
+      CENTRIFUGO_TOKEN_HMAC_SECRET_FILE: /run/secrets/centrifugo_token_secret
+      CENTRIFUGO_API_KEY_FILE: /run/secrets/centrifugo_api_key
+      # Centrifugo parses array-valued environment settings as comma-separated
+      # strings. JSON here becomes one literal origin and rejects every browser.
+      CENTRIFUGO_CLIENT_ALLOWED_ORIGINS: https://${APP_DOMAIN:?set APP_DOMAIN}
+    secrets:
+      - nats_service_password
+      - centrifugo_api_key
+      - centrifugo_token_secret
+    volumes:
+      - ./infrastructure/production/centrifugo.json:/centrifugo/config.json:ro
+    networks: [edge, data]
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  meilisearch:
+    <<: *service-defaults
+    image: getmeili/meilisearch:v1.11.3
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export MEILI_MASTER_KEY="$$(cat /run/secrets/meilisearch_master_key)"
+        exec /bin/meilisearch
+    environment:
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_DB_PATH: /meili_data/data.ms
+      MEILI_DUMP_DIR: /meili_data/dumps
+    secrets: [meilisearch_master_key]
+    volumes:
+      - meilisearch_data:/meili_data
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: ${EDGE_SUBNET:-10.253.0.0/24}
+  backend:
+    ipam:
+      config:
+        - subnet: ${BACKEND_SUBNET:-10.254.0.0/24}
+  data:
+    internal: true
+
+volumes:
+  postgres_data:
+  nats_data:
+  meilisearch_data:
+  caddy_data:
+  caddy_config:
+  # Version directories are immutable. Retain this volume across releases so a
+  # reviewed rollback can select an already verified worker artifact.
+  whatsapp_worker_artifacts:
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:?set POSTGRES_PASSWORD_FILE}
+  nats_service_password:
+    file: ${NATS_SERVICE_PASSWORD_FILE:?set NATS_SERVICE_PASSWORD_FILE}
+  nats_worker_password:
+    file: ${NATS_WORKER_PASSWORD_FILE:?set NATS_WORKER_PASSWORD_FILE}
+  worker_postgres_password:
+    file: ${WORKER_POSTGRES_PASSWORD_FILE:?set WORKER_POSTGRES_PASSWORD_FILE}
+  meilisearch_master_key:
+    file: ${MEILISEARCH_MASTER_KEY_FILE:?set MEILISEARCH_MASTER_KEY_FILE}
+  s3_access_key:
+    file: ${S3_ACCESS_KEY_FILE:?set S3_ACCESS_KEY_FILE}
+  s3_secret_key:
+    file: ${S3_SECRET_KEY_FILE:?set S3_SECRET_KEY_FILE}
+  jwt_secret:
+    file: ${JWT_SECRET_FILE:?set JWT_SECRET_FILE}
+  centrifugo_api_key:
+    file: ${CENTRIFUGO_API_KEY_FILE:?set CENTRIFUGO_API_KEY_FILE}
+  centrifugo_token_secret:
+    file: ${CENTRIFUGO_TOKEN_SECRET_FILE:?set CENTRIFUGO_TOKEN_SECRET_FILE}
+  # The API key of the mail provider named by MAIL_DRIVER, kept provider-neutral
+  # like the object-storage mounts. Set that provider's key file; the other
+  # provider's variable stays unset and needs no file of its own. Setting both
+  # is refused by the entrypoint, because one mount cannot be two providers'
+  # keys.
+  mail_api_key:
+    # Do not put a required-value operator inside the nested fallback: Compose
+    # eagerly evaluates it even when RESEND_API_KEY_FILE is set. If neither is
+    # configured, container creation cannot mount a usable secret and startup
+    # validation also rejects the selected provider's missing credential.
+    file: ${RESEND_API_KEY_FILE:-${CLOUDFLARE_EMAIL_API_TOKEN_FILE:-}}

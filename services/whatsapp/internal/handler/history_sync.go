@@ -1,0 +1,783 @@
+package handler
+
+import (
+	"context"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+
+	natsClient "github.com/ygncode-lab/whatsapp-web/services/whatsapp/internal/nats"
+)
+
+type historyConversationResult struct {
+	messages            int
+	mediaDownloaded     int
+	chatJID             string
+	remoteHistoryStatus string
+}
+
+func remoteHistoryStatus(conv *waHistorySync.Conversation) string {
+	if conv == nil || conv.EndOfHistoryTransferType == nil {
+		return "unknown"
+	}
+	switch conv.GetEndOfHistoryTransferType() {
+	case waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY:
+		return "exhausted"
+	case waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS:
+		return "unavailable"
+	case waHistorySync.Conversation_COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY,
+		waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY:
+		return "available"
+	default:
+		return "unknown"
+	}
+}
+
+// handleHistorySync is called when history sync is received.
+// Features:
+// - Parallel conversation processing using worker pool
+// - Immediate media downloads during initial sync, deferred for on-demand pages
+// - Profile picture fetching during initial sync
+func (h *Handler) handleHistorySync(evt *events.HistorySync) {
+	// Persist PN↔LID mappings before conversations are processed in parallel.
+	// Group participants and reactions frequently use LIDs in the same first-sync
+	// chunk, so waiting for whatsmeow's asynchronous persistence leaks opaque IDs.
+	h.storeHistoryLIDMappings(evt.Data.GetPhoneNumberToLidMappings())
+
+	pushNames := evt.Data.GetPushnames()
+	if len(pushNames) > 0 {
+		log.Printf("Push-name history sync received: %d contacts", len(pushNames))
+		for _, entry := range pushNames {
+			jid, err := types.ParseJID(entry.GetID())
+			if err != nil || jid.IsEmpty() {
+				continue
+			}
+			h.publishContactInfo(jid, types.EmptyJID, types.ContactInfo{PushName: entry.GetPushname()})
+		}
+		// whatsmeow persists this history chunk asynchronously. Re-read the
+		// durable store shortly afterwards to merge LID aliases and saved names.
+		go func() {
+			time.Sleep(2 * time.Second)
+			h.syncKnownContactNames()
+		}()
+	}
+
+	conversations := evt.Data.GetConversations()
+	trackedSync := isTrackedHistorySyncType(evt.Data.GetSyncType())
+	onDemandSync := evt.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
+	log.Printf(
+		"History sync received: type=%s chunk=%d progress=%d conversations=%d",
+		evt.Data.GetSyncType(),
+		evt.Data.GetChunkOrder(),
+		evt.Data.GetProgress(),
+		len(conversations),
+	)
+	if trackedSync {
+		h.beginHistorySyncChunk()
+	}
+
+	startTime := time.Now()
+
+	// Use channels for worker pool pattern
+	jobs := make(chan int, len(conversations))
+	results := make(chan historyConversationResult, len(conversations))
+
+	// Start worker pool
+	var wg sync.WaitGroup
+	for w := 0; w < historySyncWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				conv := conversations[idx]
+				result := h.processHistorySyncConversation(conv, onDemandSync)
+				results <- result
+			}
+		}()
+	}
+
+	// Send jobs to workers
+	for i := range conversations {
+		jobs <- i
+	}
+	close(jobs)
+
+	// Wait for workers to finish in background goroutine
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results and publish progress
+	var totalMessages, totalMediaDownloaded, conversationsProcessed int
+	for result := range results {
+		totalMessages += result.messages
+		totalMediaDownloaded += result.mediaDownloaded
+		conversationsProcessed++
+		if evt.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND &&
+			result.chatJID != "" &&
+			h.historyPagePublisher != nil {
+			if err := h.historyPagePublisher.PublishHistorySyncPage(
+				result.chatJID,
+				result.messages,
+				result.remoteHistoryStatus,
+			); err != nil {
+				log.Printf(
+					"Failed to publish on-demand history result for %s: %v",
+					result.chatJID,
+					err,
+				)
+			}
+		}
+		if trackedSync {
+			h.addHistorySyncProgress(result.messages, 1)
+		}
+
+		// Publish cumulative progress every 10 conversations to avoid flooding.
+		if trackedSync && conversationsProcessed%10 == 0 {
+			h.publishHistorySyncProgress()
+		}
+	}
+
+	// Ensure every chunk has a final cumulative progress event, including empty
+	// chunks. Completion is published after it, preserving JetStream ordering.
+	if trackedSync && (conversationsProcessed%10 != 0 || conversationsProcessed == 0) {
+		h.publishHistorySyncProgress()
+	}
+	if trackedSync {
+		h.finishHistorySyncChunk(isFinalHistorySyncChunk(evt.Data))
+	}
+
+	// Account-level username records can be separate from conversation records.
+	// Publish them after conversations so name-only metadata can update contacts
+	// created by this same history chunk without creating address-book-only chats.
+	h.publishHistoryAccountUsernames(evt.Data.GetAccounts())
+
+	elapsed := time.Since(startTime)
+	log.Printf("History sync complete: %d messages, %d media downloaded (took %v)",
+		totalMessages, totalMediaDownloaded, elapsed.Round(time.Millisecond))
+}
+
+func (h *Handler) publishHistoryAccountUsernames(accounts []*waHistorySync.Account) {
+	if h.publisher == nil {
+		return
+	}
+
+	for _, account := range accounts {
+		if account == nil || account.GetLid() == "" || (account.Username == nil && !account.GetIsUsernameDeleted()) {
+			continue
+		}
+
+		rawLID := strings.TrimSpace(account.GetLid())
+		var lidJID types.JID
+		var err error
+		if strings.Contains(rawLID, "@") {
+			lidJID, err = types.ParseJID(rawLID)
+		} else {
+			lidJID = types.NewJID(rawLID, types.HiddenUserServer)
+		}
+		if err != nil || lidJID.IsEmpty() || (lidJID.Server != types.HiddenUserServer && lidJID.Server != types.HostedLIDServer) {
+			continue
+		}
+
+		preferredJID := h.resolvePreferredJID(lidJID.ToNonAD(), types.EmptyJID)
+		username := account.GetUsername()
+		if err := h.publisher.PublishContactUsername(preferredJID.String(), &username); err != nil {
+			log.Printf("Failed to publish username for %s: %v", preferredJID.String(), err)
+		}
+	}
+}
+
+func (h *Handler) storeHistoryLIDMappings(mappings []*waHistorySync.PhoneNumberToLIDMapping) {
+	if len(mappings) == 0 || h.config.Client == nil {
+		return
+	}
+	client := h.config.Client.GetClient()
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stored := 0
+	for _, mapping := range mappings {
+		if mapping == nil {
+			continue
+		}
+		pnJID, pnErr := types.ParseJID(mapping.GetPnJID())
+		lidJID, lidErr := types.ParseJID(mapping.GetLidJID())
+		if pnErr != nil || lidErr != nil || pnJID.IsEmpty() || lidJID.IsEmpty() {
+			continue
+		}
+		if err := client.Store.LIDs.PutLIDMapping(
+			ctx,
+			lidJID.ToNonAD(),
+			pnJID.ToNonAD(),
+		); err != nil {
+			log.Printf("Failed to persist history LID mapping %s -> %s: %v", lidJID.String(), pnJID.String(), err)
+			continue
+		}
+		stored++
+	}
+	if stored > 0 {
+		log.Printf("Persisted %d PN/LID mappings before history processing", stored)
+	}
+}
+
+func (h *Handler) getHistoryGroupParticipants(conv *waHistorySync.Conversation) []natsClient.GroupParticipantPayload {
+	participants := make([]natsClient.GroupParticipantPayload, 0, len(conv.GetParticipant()))
+	for _, participant := range conv.GetParticipant() {
+		if participant == nil || participant.GetUserJID() == "" {
+			continue
+		}
+		participantJID, err := types.ParseJID(participant.GetUserJID())
+		if err != nil || participantJID.User == "" || participantJID.Server == "" {
+			log.Printf("Skipping invalid participant JID %s: %v", participant.GetUserJID(), err)
+			continue
+		}
+		preferredJID := h.resolvePreferredJID(participantJID.ToNonAD(), types.EmptyJID)
+		participants = append(participants, natsClient.GroupParticipantPayload{
+			JID:     preferredJID.String(),
+			IsAdmin: participant.GetRank() != waHistorySync.GroupParticipant_REGULAR,
+		})
+	}
+	return participants
+}
+
+// processHistorySyncConversation processes a single conversation during history sync.
+// Returns the count of messages processed and media items downloaded.
+// Uses concrete proto type *waHistorySync.Conversation for reliable type handling.
+func (h *Handler) processHistorySyncConversation(conv *waHistorySync.Conversation, deferMedia bool) (result historyConversationResult) {
+	if conv == nil {
+		return
+	}
+	result.remoteHistoryStatus = remoteHistoryStatus(conv)
+
+	// Prefer pnJID (phone number JID) over ID (which can be LID).
+	// whatsmeow expects phone number JIDs for sending messages and looks up LID mappings internally.
+	// Sending directly to LID JIDs causes encryption failures (error 479).
+	rawJID := conv.GetPnJID()
+	lidJID := conv.GetLidJID()
+
+	// Fall back to ID if pnJID is not available (e.g., for groups or older sync data)
+	if rawJID == "" {
+		rawJID = conv.GetID()
+	}
+
+	if rawJID == "" {
+		return
+	}
+
+	// Parse and normalize JID to remove any device suffix
+	parsedJID, err := types.ParseJID(rawJID)
+	if err != nil {
+		log.Printf("Failed to parse JID %s: %v", rawJID, err)
+		return
+	}
+
+	// ON_DEMAND responses can identify a conversation only by LID while carrying
+	// the corresponding phone-number mapping elsewhere in the same history
+	// payload. Those mappings are persisted before conversations are processed,
+	// so resolve the canonical phone JID before deciding the chat is unusable.
+	resolvedJID := h.resolvePreferredJID(parsedJID, types.EmptyJID)
+	if resolvedJID.Server == types.HiddenUserServer || resolvedJID.Server == types.HostedLIDServer {
+		// A private-number conversation may still carry WhatsApp's public
+		// username. Persist that identity for an existing live conversation even
+		// though history cannot safely create a sendable phone-number chat.
+		if conv.Username != nil && h.publisher != nil {
+			if err := h.publisher.PublishContactUsername(resolvedJID.ToNonAD().String(), conv.Username); err != nil {
+				log.Printf("Failed to publish username for LID-only contact %s: %v", rawJID, err)
+			}
+		}
+		log.Printf("Skipping LID-only contact %s (no phone number mapping available)", rawJID)
+		return
+	}
+
+	normalizedJID := resolvedJID.ToNonAD()
+	jid := normalizedJID.String()
+	result.chatJID = jid
+
+	// Store LID mapping if both pnJID and lidJID are available.
+	// This allows whatsmeow to look up the LID for encryption when sending to the phone number JID.
+	if lidJID != "" && h.config.Client != nil {
+		parsedLID, err := types.ParseJID(lidJID)
+		if err == nil {
+			client := h.config.Client.GetClient()
+			if client != nil && client.Store != nil && client.Store.LIDs != nil {
+				ctx := context.Background()
+				normalizedLID := parsedLID.ToNonAD()
+				if err := client.Store.LIDs.PutLIDMapping(ctx, normalizedLID, normalizedJID); err != nil {
+					log.Printf("Failed to store LID mapping %s -> %s: %v", normalizedLID.String(), jid, err)
+				}
+			}
+		}
+	}
+
+	// Determine if this is a group chat using multiple indicators:
+	// 1. JID suffix (@g.us for groups, @s.whatsapp.net for users) - most reliable
+	// 2. IsDefaultSubgroup flag (for community subgroups)
+	// 3. Participant list presence (groups have participants)
+	isGroup := strings.HasSuffix(jid, "@g.us") ||
+		conv.GetIsDefaultSubgroup() ||
+		len(conv.GetParticipant()) > 0
+
+	// Get display name from conversation. WhatsApp sometimes returns a privacy
+	// placeholder such as "+65∙∙∙∙∙∙06"; it is not a contact name.
+	displayName := conv.GetDisplayName()
+	name := conv.GetName()
+	if !isGroup && isRedactedContactLabel(displayName) {
+		displayName = ""
+	}
+	if !isGroup && isRedactedContactLabel(name) {
+		name = ""
+	}
+
+	// Get unread count and group membership from WhatsApp's conversation
+	// snapshot. The API persists both so Chats and Groups render one coherent
+	// name/count state instead of inferring metadata from message history.
+	unreadCount := int(conv.GetUnreadCount())
+	var participants []natsClient.GroupParticipantPayload
+	if isGroup {
+		participants = h.getHistoryGroupParticipants(conv)
+	}
+
+	// Fetch profile picture during history sync
+	var profilePicURL string
+	if !deferMedia && h.config.Client != nil && h.config.Storage != nil {
+		var profilePicErr error
+		profilePicURL, profilePicErr = h.fetchProfilePicture(normalizedJID)
+		if profilePicErr != nil {
+			log.Printf("Failed to fetch profile picture for %s during history sync: %v", jid, profilePicErr)
+		}
+	}
+
+	// Publish contact to NATS
+	if h.publisher != nil {
+		if err := h.publisher.PublishContact(jid, name, displayName, conv.GetDescription(), conv.Username, isGroup, unreadCount, participants, profilePicURL); err != nil {
+			log.Printf("Failed to publish contact %s: %v", jid, err)
+		}
+	}
+
+	// Saved address-book names and push names live in whatsmeow's contact store,
+	// not reliably in the conversation's displayName field.
+	if !isGroup && h.config.Client != nil {
+		client := h.config.Client.GetClient()
+		if client != nil && client.Store != nil && client.Store.Contacts != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			contactInfo, err := client.Store.Contacts.GetContact(ctx, normalizedJID)
+			cancel()
+			if err == nil {
+				h.publishContactInfo(normalizedJID, types.EmptyJID, contactInfo)
+			}
+		}
+	}
+
+	// Subscribe to presence updates for this contact (skip groups)
+	// This allows us to receive online/offline status updates
+	if !isGroup && h.config.Client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := h.config.Client.SubscribePresence(ctx, normalizedJID); err != nil {
+			// Log but don't fail - presence subscription is not critical
+			log.Printf("Failed to subscribe to presence for %s: %v", jid, err)
+		}
+	}
+
+	// Process messages using concrete type
+	for _, historyMsg := range conv.GetMessages() {
+		processed, hasMedia := h.processHistorySyncMessage(
+			historyMsg,
+			jid,
+			isGroup,
+			deferMedia,
+		)
+		if processed {
+			result.messages++
+			if hasMedia {
+				result.mediaDownloaded++
+			}
+		}
+	}
+
+	return
+}
+
+func (h *Handler) getHistorySenderJID(chatJID, participant string, isGroup bool) string {
+	if !isGroup || participant == "" {
+		return chatJID
+	}
+	parsedParticipant, err := types.ParseJID(participant)
+	if err != nil {
+		return chatJID
+	}
+	return h.resolvePreferredJID(parsedParticipant, types.EmptyJID).String()
+}
+
+// WhatsApp has used both locations for a group-history author. Newer payloads
+// commonly put it on WebMessageInfo.Participant while older ones put it inside
+// MessageKey.Participant. Reading only the key silently turns the group itself
+// into the sender and makes the API render "Unknown participant".
+func getHistoryParticipant(msg *waWeb.WebMessageInfo) string {
+	if msg == nil {
+		return ""
+	}
+	if participant := msg.GetKey().GetParticipant(); participant != "" {
+		return participant
+	}
+	return msg.GetParticipant()
+}
+
+func normalizeHistoryMessageStatus(status waWeb.WebMessageInfo_Status) string {
+	switch status {
+	case waWeb.WebMessageInfo_PENDING:
+		return "pending"
+	case waWeb.WebMessageInfo_SERVER_ACK:
+		return "sent"
+	case waWeb.WebMessageInfo_DELIVERY_ACK:
+		return "delivered"
+	case waWeb.WebMessageInfo_READ, waWeb.WebMessageInfo_PLAYED:
+		return "read"
+	case waWeb.WebMessageInfo_ERROR:
+		return "failed"
+	default:
+		return ""
+	}
+}
+
+// processHistorySyncMessage processes a single message from history sync.
+// Returns (processed, hasMedia) - whether the message was processed and if it had media.
+// Uses concrete proto type *waHistorySync.HistorySyncMsg for reliable type handling.
+func (h *Handler) processHistorySyncMessage(historyMsg *waHistorySync.HistorySyncMsg, jid string, isGroup bool, deferMedia bool) (bool, bool) {
+	if historyMsg == nil {
+		return false, false
+	}
+
+	msg := historyMsg.GetMessage()
+	if msg == nil || msg.Message == nil {
+		return false, false
+	}
+
+	// Extract timestamp with proper handling for zero/missing values
+	var timestamp time.Time
+	msgTimestamp := msg.GetMessageTimestamp()
+	if msgTimestamp > 0 {
+		timestamp = time.Unix(int64(msgTimestamp), 0)
+	} else {
+		// Log missing timestamp for debugging - this should be rare
+		log.Printf("Missing timestamp for message %s in chat %s, using current time", msg.GetKey().GetID(), jid)
+		timestamp = time.Now()
+	}
+
+	// Group history keys carry the actual author in Participant while the
+	// conversation JID is the group. Keeping From as the group loses who sent
+	// every imported message.
+	participant := getHistoryParticipant(msg)
+	senderJID := h.getHistorySenderJID(jid, participant, isGroup)
+
+	// Build message event with history sync flag
+	msgEvent := natsClient.MessageEvent{
+		MessageID:     msg.GetKey().GetID(),
+		From:          senderJID,
+		To:            jid,
+		FromMe:        msg.GetKey().GetFromMe(),
+		IsGroup:       isGroup,
+		GroupID:       jid,
+		Timestamp:     timestamp,
+		IsHistorySync: true, // Mark as history sync message
+	}
+	if isGroup {
+		if participantJID, err := types.ParseJID(participant); err == nil {
+			msgEvent.ProtocolSenderJID = participantJID.ToNonAD().String()
+		}
+	}
+	if msg.GetKey().GetFromMe() && msg.Status != nil {
+		msgEvent.Status = normalizeHistoryMessageStatus(msg.GetStatus())
+	}
+
+	// Get push name
+	msgEvent.SenderName = msg.GetPushName()
+
+	// Extract content based on message type
+	waMsg := unwrapMediaAlbumMessage(msg.GetMessage())
+	if waMsg == nil {
+		return false, false
+	}
+	if album := waMsg.GetAlbumMessage(); album != nil {
+		h.rememberMediaAlbum(jid, msg.GetKey().GetID(), album)
+		return false, false
+	}
+	msgEvent.QuotedMessageID = getQuotedMessageID(waMsg)
+	msgEvent.GroupMentions = getGroupMentions(waMsg)
+	h.applyMediaAlbumMetadata(jid, waMsg, &msgEvent)
+
+	hasMedia := false
+
+	// Text message
+	if waMsg.Conversation != nil {
+		msgEvent.Type = "text"
+		msgEvent.Content = *waMsg.Conversation
+	} else if waMsg.ExtendedTextMessage != nil {
+		msgEvent.Type = "text"
+		if waMsg.ExtendedTextMessage.Text != nil {
+			msgEvent.Content = *waMsg.ExtendedTextMessage.Text
+		}
+	}
+
+	// Image message - download immediately
+	if waMsg.ImageMessage != nil {
+		msgEvent.Type = "image"
+		if waMsg.ImageMessage.Caption != nil {
+			msgEvent.Caption = *waMsg.ImageMessage.Caption
+		}
+		if waMsg.ImageMessage.Mimetype != nil {
+			msgEvent.MediaType = *waMsg.ImageMessage.Mimetype
+		}
+		if h.processHistoryMedia(waMsg.ImageMessage, &msgEvent, deferMedia) {
+			hasMedia = true
+		}
+	}
+
+	// Video message - download immediately
+	if waMsg.VideoMessage != nil {
+		msgEvent.Type = "video"
+		if waMsg.VideoMessage.Caption != nil {
+			msgEvent.Caption = *waMsg.VideoMessage.Caption
+		}
+		if waMsg.VideoMessage.Mimetype != nil {
+			msgEvent.MediaType = *waMsg.VideoMessage.Mimetype
+		}
+		if h.processHistoryMedia(waMsg.VideoMessage, &msgEvent, deferMedia) {
+			hasMedia = true
+		}
+	}
+
+	// Audio message - download immediately
+	if waMsg.AudioMessage != nil {
+		msgEvent.Type = "audio"
+		if waMsg.AudioMessage.Mimetype != nil {
+			msgEvent.MediaType = *waMsg.AudioMessage.Mimetype
+		}
+		if h.processHistoryMedia(waMsg.AudioMessage, &msgEvent, deferMedia) {
+			hasMedia = true
+		}
+	}
+
+	// Document message - download immediately
+	if waMsg.DocumentMessage != nil {
+		msgEvent.Type = "document"
+		if waMsg.DocumentMessage.Caption != nil {
+			msgEvent.Caption = *waMsg.DocumentMessage.Caption
+		}
+		if waMsg.DocumentMessage.FileName != nil {
+			msgEvent.FileName = *waMsg.DocumentMessage.FileName
+		}
+		if waMsg.DocumentMessage.Mimetype != nil {
+			msgEvent.MediaType = *waMsg.DocumentMessage.Mimetype
+		}
+		if h.processHistoryMedia(waMsg.DocumentMessage, &msgEvent, deferMedia) {
+			hasMedia = true
+		}
+	}
+
+	// Sticker message - download immediately
+	if waMsg.StickerMessage != nil {
+		msgEvent.Type = "sticker"
+		if waMsg.StickerMessage.Mimetype != nil {
+			msgEvent.MediaType = *waMsg.StickerMessage.Mimetype
+		}
+		if h.processHistoryMedia(waMsg.StickerMessage, &msgEvent, deferMedia) {
+			hasMedia = true
+		}
+	}
+
+	// Contact shares have no downloadable media, but their vCards carry the
+	// phone details needed to render more than a display-name placeholder.
+	if waMsg.ContactMessage != nil {
+		msgEvent.Type = "contact"
+		msgEvent.Content = waMsg.ContactMessage.GetDisplayName()
+		msgEvent.ContactCards = contactCardPayloads([]*waE2E.ContactMessage{
+			waMsg.ContactMessage,
+		})
+	}
+	if waMsg.ContactsArrayMessage != nil {
+		msgEvent.Type = "contact"
+		msgEvent.Content = waMsg.ContactsArrayMessage.GetDisplayName()
+		msgEvent.ContactCards = contactCardPayloads(
+			waMsg.ContactsArrayMessage.GetContacts(),
+		)
+	}
+
+	// Skip if we couldn't determine message type
+	if msgEvent.Type == "" {
+		return false, false
+	}
+
+	// Publish message to NATS
+	if h.publisher != nil {
+		if err := h.publisher.PublishMessage(msgEvent); err != nil {
+			log.Printf("Failed to publish history message: %v", err)
+			return false, false
+		}
+	}
+
+	// Extract and publish reactions from history sync
+	// Source 1: ReactionMessage within the message structure (when the message IS a reaction)
+	if waMsg.ReactionMessage != nil && waMsg.ReactionMessage.Key != nil {
+		h.processHistorySyncReaction(waMsg.ReactionMessage, msg, jid)
+	}
+
+	// Source 2: Reactions array on WebMessageInfo (reactions ON this message from other users)
+	// This is the primary source for reactions during history sync
+	h.processMessageReactions(msg, jid)
+
+	return true, hasMedia
+}
+
+func (h *Handler) resolveHistoryIdentity(rawJID string) string {
+	parsedJID, err := types.ParseJID(rawJID)
+	if err != nil || parsedJID.IsEmpty() {
+		return ""
+	}
+	return h.resolvePreferredJID(parsedJID, types.EmptyJID).String()
+}
+
+func (h *Handler) ownHistoryIdentity() string {
+	if h.config.Client == nil {
+		return ""
+	}
+	client := h.config.Client.GetClient()
+	if client == nil || client.Store == nil || client.Store.ID == nil {
+		return ""
+	}
+	return client.Store.ID.ToNonAD().String()
+}
+
+// processHistorySyncReaction processes a reaction found during history sync
+func (h *Handler) processHistorySyncReaction(reactionMsg *waE2E.ReactionMessage, msg *waWeb.WebMessageInfo, chatJID string) {
+	if reactionMsg == nil || reactionMsg.Key == nil {
+		return
+	}
+
+	targetMsgID := reactionMsg.Key.GetID()
+	if targetMsgID == "" {
+		return
+	}
+
+	emoji := reactionMsg.GetText()
+
+	// Parse and normalize sender JID from the message key
+	var senderJID string
+	if msg.GetKey().GetParticipant() != "" {
+		// Group message - use participant field and resolve private LIDs.
+		senderJID = h.resolveHistoryIdentity(msg.GetKey().GetParticipant())
+	} else if msg.GetKey().GetFromMe() {
+		senderJID = h.ownHistoryIdentity()
+	} else if msg.GetKey().GetRemoteJID() != "" {
+		// Direct message - use remote JID.
+		senderJID = h.resolveHistoryIdentity(msg.GetKey().GetRemoteJID())
+	}
+
+	if senderJID == "" {
+		log.Printf("Could not determine sender JID for reaction on message %s", targetMsgID)
+		return
+	}
+
+	// Get timestamp from the message
+	timestamp := time.Unix(int64(msg.GetMessageTimestamp()), 0)
+
+	log.Printf("Processing history sync reaction from %s: %s on message %s",
+		senderJID, emoji, targetMsgID)
+
+	// Publish reaction to NATS using existing publisher
+	if h.publisher != nil {
+		if err := h.publisher.PublishReaction(
+			targetMsgID,
+			senderJID,
+			chatJID,
+			emoji,
+			timestamp,
+		); err != nil {
+			log.Printf("Failed to publish history reaction: %v", err)
+		}
+	}
+}
+
+// processMessageReactions processes the Reactions array on a WebMessageInfo.
+// This array contains all reactions ON the message from other users (received during history sync).
+// This is distinct from ReactionMessage which is when the message itself IS a reaction.
+func (h *Handler) processMessageReactions(msg *waWeb.WebMessageInfo, chatJID string) {
+	if msg == nil || h.publisher == nil {
+		return
+	}
+
+	reactions := msg.GetReactions()
+	if len(reactions) == 0 {
+		return
+	}
+
+	// Get the target message ID (the message these reactions are on)
+	targetMsgID := msg.GetKey().GetID()
+	if targetMsgID == "" {
+		return
+	}
+
+	for _, reaction := range reactions {
+		if reaction == nil || reaction.Key == nil {
+			continue
+		}
+
+		// Get reactor JID from the reaction key
+		// The reactor can be in Participant (for groups) or RemoteJID (for direct chats)
+		var reactorJID string
+		if reaction.Key.GetParticipant() != "" {
+			// Group - reactor is in Participant field. Resolve private LIDs before
+			// publishing so first-sync reactions use the same identity as members.
+			reactorJID = h.resolveHistoryIdentity(reaction.Key.GetParticipant())
+		} else if reaction.Key.GetFromMe() {
+			reactorJID = h.ownHistoryIdentity()
+		} else if reaction.Key.GetRemoteJID() != "" {
+			// Direct chat - reactor is in RemoteJID.
+			reactorJID = h.resolveHistoryIdentity(reaction.Key.GetRemoteJID())
+		}
+
+		if reactorJID == "" {
+			continue
+		}
+
+		// Get emoji text
+		emoji := reaction.GetText()
+		if emoji == "" {
+			continue // Skip empty reactions (reaction removals)
+		}
+
+		// Get timestamp from reaction (milliseconds)
+		var timestamp time.Time
+		if ts := reaction.GetSenderTimestampMS(); ts > 0 {
+			timestamp = time.UnixMilli(ts)
+		} else {
+			// Fallback to message timestamp
+			timestamp = time.Unix(int64(msg.GetMessageTimestamp()), 0)
+		}
+
+		log.Printf("Processing reaction on message %s from %s: %s", targetMsgID, reactorJID, emoji)
+
+		// Publish reaction to NATS
+		if err := h.publisher.PublishReaction(
+			targetMsgID,
+			reactorJID,
+			chatJID,
+			emoji,
+			timestamp,
+		); err != nil {
+			log.Printf("Failed to publish message reaction: %v", err)
+		}
+	}
+}

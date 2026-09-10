@@ -1,0 +1,186 @@
+/**
+ * API Module Index
+ * Re-exports all API functions and types for backward compatibility
+ *
+ * Usage: import { ... } from "@/lib/api"
+ */
+
+// Re-export API token (MCP) functions
+export {
+  createApiToken,
+  getApiTokens,
+  revokeApiToken,
+} from "./api-tokens.js";
+// Re-export analytics functions
+export {
+  getResponseTimeStats,
+  getResponseTimeTrend,
+  getSlaBreaches,
+  getTeamResponseTimeStats,
+} from "./analytics.js";
+// Re-export resolution (case-cycle) analytics functions
+export {
+  getCaseResolutionStats,
+  getCaseResolutionTrend,
+  getOverdueActiveCases,
+  getTeamCaseResolutionStats,
+} from "./resolution-analytics.js";
+// Re-export auth functions
+export {
+  changeCurrentUserPassword,
+  forgotPassword,
+  getCurrentUser,
+  healthCheck,
+  login,
+  logout,
+  register,
+  resendVerification,
+  resetPassword,
+  updateCurrentUserProfile,
+  verifyEmail,
+} from "./auth.js";
+// Re-export catalogs functions
+export {
+  archiveCatalog,
+  getCatalogProducts,
+  getCatalogSyncStatus,
+  getWhatsAppCatalog,
+  getWhatsAppCatalogs,
+  restoreCatalog,
+  triggerCatalogProductsSync,
+  triggerCatalogSync,
+  updateProductVisibility,
+} from "./catalogs.js";
+// Re-export client utilities
+export {
+  API_BASE_URL,
+  ApiRequestError,
+  api,
+  attemptTokenRefresh,
+  buildQueryString,
+  clearAuthTokens,
+  clearCompanyId,
+  fetchApi,
+  fetchBlobWithAuth,
+  fetchWithAuth,
+  getAccessToken,
+  getCompanyId,
+  handleResponse,
+  initializeAuth,
+  setAuthToken,
+  setCompanyId,
+} from "./client.js";
+// Re-export companies functions
+export { getUserCompanies } from "./companies.js";
+// Re-export SLA policy functions
+export {
+  createSlaPolicy,
+  getCurrentSlaPolicy,
+  getSlaPolicyHistory,
+} from "./sla-policy.js";
+// Re-export contacts functions
+export {
+  downloadImportTemplate,
+  getContact,
+  getContacts,
+  importContacts,
+  previewContactImport,
+  updateContact,
+} from "./contacts.js";
+// Re-export conversations functions
+export {
+  getConversation,
+  getConversations,
+  markConversationAsRead,
+  updateConversation,
+} from "./conversations.js";
+// Re-export labels functions
+export {
+  applyLabelToContact,
+  autoCreateTagsFromLabels,
+  getLabelSyncStatus,
+  getTagsWithLabelStatus,
+  getWhatsAppLabel,
+  getWhatsAppLabels,
+  linkTagToLabel,
+  removeLabelFromContact,
+  triggerLabelSync,
+  unlinkTagFromLabel,
+} from "./labels.js";
+// Re-export messages functions
+export {
+  deleteMessage,
+  getMessages,
+  sendMessage,
+  uploadMedia,
+} from "./messages.js";
+
+// Re-export notifications functions
+export {
+  createNotification,
+  deleteNotification,
+  getNotificationById,
+  getNotificationPreferences,
+  getNotifications,
+  getPushStatus,
+  getUnreadNotificationCount,
+  markAllNotificationsAsRead,
+  markNotificationAsRead,
+  muteContactApi,
+  subscribeToPush,
+  unmuteContactApi,
+  unsubscribeAllPush,
+  unsubscribeFromPush,
+  updateNotificationPreferences,
+} from "./notifications.js";
+
+// Re-export scheduled-messages functions
+export {
+  cancelScheduledMessage,
+  createScheduledMessage,
+  getScheduledMessages,
+  type ScheduleMessageInput,
+  type ScheduleMessageResponse,
+} from "./scheduled-messages.js";
+
+// Re-export bulk broadcast job functions
+export {
+  cancelBulkJob,
+  createBulkJob,
+  getBulkJob,
+  getBulkJobRecipients,
+  getBulkJobs,
+  previewBulkJob,
+  rescheduleBulkJob,
+  type BulkJobListPage,
+  type BulkJobRecipientsPage,
+  type CreateBulkJobInput,
+  type PreviewBulkJobInput,
+} from "./bulk-jobs.js";
+
+// Re-export quick-replies functions
+export {
+  createQuickReply,
+  deleteQuickReply,
+  getAutoReplySettings,
+  getQuickReplies,
+  getQuickReplyById,
+  getQuickReplyByShortcut,
+  updateAutoReplySettings,
+  updateQuickReply,
+} from "./quick-replies.js";
+// Re-export types
+export * from "./types.js";
+// Re-export whatsapp functions
+export {
+  connectWhatsApp,
+  createWhatsAppConnection,
+  deleteWhatsAppConnection,
+  disconnectWhatsApp,
+  disconnectWhatsAppConnection,
+  getWhatsAppConnection,
+  getWhatsAppStatus,
+  listWhatsAppConnections,
+  reconnectWhatsAppConnection,
+  updateWhatsAppConnection,
+} from "./whatsapp.js";

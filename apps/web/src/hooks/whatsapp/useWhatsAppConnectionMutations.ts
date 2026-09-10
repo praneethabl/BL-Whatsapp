@@ -1,0 +1,291 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { nowMs } from "@blwhatsappcopy/shared";
+import { useCallback, useEffect, useRef } from "react";
+import { reconcileRealtimeState } from "@/contexts/realtime/event-handlers";
+import { ApiRequestError } from "@/lib/api/client";
+import type { WhatsAppConnection } from "@/lib/api/types";
+import { productAnalytics } from "@/lib/product-analytics";
+import {
+  createWhatsAppConnection,
+  deleteWhatsAppConnection,
+  disconnectWhatsAppConnection,
+  reconnectWhatsAppConnection,
+  updateWhatsAppConnection,
+} from "@/lib/api/whatsapp";
+import { useChatStore } from "@/stores/chat-store";
+import { queryKeys } from "../query-keys";
+import {
+  clearConnectionTransition,
+  expectConnectionTransition,
+} from "./connection-analytics";
+import type { ConnectionState } from "./types";
+
+interface UseMutationsOptions {
+  updateConnectionState: (
+    connectionId: string,
+    updates: Partial<ConnectionState>,
+  ) => void;
+  setPendingConnection: React.Dispatch<
+    React.SetStateAction<{
+      qrCode: string | null;
+      qrExpiresAt: Date | null;
+      error: string | null;
+      tempId: string | null;
+    } | null>
+  >;
+  setGlobalError: React.Dispatch<React.SetStateAction<string | null>>;
+  clearQrTimeout: (connectionId: string) => void;
+}
+
+/**
+ * Hook for WhatsApp connection mutations (create, delete, reconnect, disconnect, rename)
+ */
+export function useWhatsAppConnectionMutations({
+  updateConnectionState,
+  setPendingConnection,
+  setGlobalError,
+  clearQrTimeout,
+}: UseMutationsOptions) {
+  const queryClient = useQueryClient();
+  const reconnectReconciliationTimersRef = useRef<
+    ReturnType<typeof setTimeout>[]
+  >([]);
+
+  const clearReconnectReconciliationTimers = useCallback(() => {
+    reconnectReconciliationTimersRef.current.forEach(clearTimeout);
+    reconnectReconciliationTimersRef.current = [];
+  }, []);
+
+  const scheduleReconnectReconciliation = useCallback(() => {
+    clearReconnectReconciliationTimers();
+
+    // The reconnect endpoint returns after spawning the worker, before
+    // whatsmeow has replayed queued messages. Reconcile a few times during the
+    // bounded catch-up window so correctness does not depend on receiving every
+    // realtime publication and the user never has to refresh the page.
+    reconnectReconciliationTimersRef.current = [3_000, 8_000].map((delay) =>
+      setTimeout(() => {
+        reconcileRealtimeState(
+          queryClient,
+          useChatStore.getState().selectedConversationId,
+        );
+      }, delay),
+    );
+  }, [clearReconnectReconciliationTimers, queryClient]);
+
+  useEffect(
+    () => clearReconnectReconciliationTimers,
+    [clearReconnectReconciliationTimers],
+  );
+
+  // Create connection mutation
+  const createMutation = useMutation({
+    mutationFn: (name?: string) => createWhatsAppConnection(name),
+    onMutate: () => {
+      setGlobalError(null);
+      // Set up pending connection state
+      setPendingConnection({
+        qrCode: null,
+        qrExpiresAt: null,
+        error: null,
+        tempId: `temp-${nowMs()}`,
+      });
+    },
+    onSuccess: (connection) => {
+      // Clear pending state and set up the new connection's state
+      const connectionId = connection.id;
+      setPendingConnection(null);
+      updateConnectionState(connectionId, {
+        qrCode: null,
+        qrExpiresAt: null,
+        error: null,
+        isConnecting: true,
+        isDisconnecting: false,
+      });
+
+      // Optimistically add the new connection to the React Query cache
+      queryClient.setQueryData<WhatsAppConnection[]>(
+        queryKeys.whatsapp.lists(),
+        (oldConnections = []) => {
+          if (oldConnections.some((c) => c.id === connectionId)) {
+            return oldConnections;
+          }
+          return [...oldConnections, connection];
+        },
+      );
+
+      // Also invalidate to ensure we eventually get fresh data from server
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.whatsapp.lists(),
+      });
+
+      // Outcome instrumentation: the backend accepted the setup request, and
+      // the realtime "connected" transition should count as a new pairing.
+      productAnalytics.track("whatsapp_connection_setup_started", {});
+      expectConnectionTransition(connectionId, "new");
+    },
+    onError: (error: Error) => {
+      let errorMessage = error.message;
+
+      // Handle max connections exceeded error (429)
+      if (error instanceof ApiRequestError && error.statusCode === 429) {
+        errorMessage =
+          "You've reached the maximum number of WhatsApp connections allowed for your plan. Please disconnect an existing connection or upgrade your plan.";
+        setGlobalError(errorMessage);
+      }
+
+      setPendingConnection((prev) =>
+        prev ? { ...prev, error: errorMessage } : null,
+      );
+    },
+  });
+
+  // Reconnect connection mutation
+  const reconnectMutation = useMutation({
+    mutationFn: (connectionId: string) =>
+      reconnectWhatsAppConnection(connectionId),
+    onMutate: (connectionId) => {
+      updateConnectionState(connectionId, {
+        isConnecting: true,
+        error: null,
+      });
+      // Register before the request resolves: the realtime "connected" event
+      // can arrive ahead of the HTTP onSuccess callback.
+      expectConnectionTransition(connectionId, "reconnect");
+    },
+    onSuccess: (_data, connectionId) => {
+      updateConnectionState(connectionId, {
+        isConnecting: true,
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.whatsapp.lists(),
+      });
+      scheduleReconnectReconciliation();
+    },
+    onError: (error: Error, connectionId) => {
+      clearConnectionTransition(connectionId);
+      updateConnectionState(connectionId, {
+        isConnecting: false,
+        error: error.message,
+      });
+    },
+  });
+
+  // Disconnect connection mutation
+  const disconnectMutation = useMutation({
+    mutationFn: (connectionId: string) =>
+      disconnectWhatsAppConnection(connectionId),
+    onMutate: (connectionId) => {
+      updateConnectionState(connectionId, {
+        isDisconnecting: true,
+        error: null,
+      });
+    },
+    onSuccess: (_data, connectionId) => {
+      updateConnectionState(connectionId, {
+        qrCode: null,
+        qrExpiresAt: null,
+        isConnecting: false,
+        isDisconnecting: false,
+      });
+      // A user-initiated disconnect ends any pending setup/reconnect flow.
+      clearConnectionTransition(connectionId);
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.whatsapp.lists(),
+      });
+    },
+    onError: (error: Error, connectionId) => {
+      updateConnectionState(connectionId, {
+        isDisconnecting: false,
+        error: error.message,
+      });
+    },
+  });
+
+  // Archive the stable account and unlink its replaceable WhatsApp session.
+  const deleteMutation = useMutation({
+    mutationFn: (connectionId: string) =>
+      deleteWhatsAppConnection(connectionId),
+    onSuccess: (_data, connectionId) => {
+      // Remove from local state
+      updateConnectionState(connectionId, {
+        qrCode: null,
+        qrExpiresAt: null,
+        error: null,
+        isConnecting: false,
+        isDisconnecting: false,
+      });
+      // Clear any QR timeout
+      clearQrTimeout(connectionId);
+      // A deleted connection can never produce a user-attributable connect.
+      clearConnectionTransition(connectionId);
+      // Invalidate list
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.whatsapp.lists(),
+      });
+    },
+  });
+
+  // Update connection mutation
+  const updateMutation = useMutation({
+    mutationFn: ({
+      connectionId,
+      data,
+    }: {
+      connectionId: string;
+      data: { name?: string };
+    }) => updateWhatsAppConnection(connectionId, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.whatsapp.lists(),
+      });
+    },
+  });
+
+  // Actions
+  const create = useCallback(
+    async (name?: string) => {
+      return createMutation.mutateAsync(name);
+    },
+    [createMutation],
+  );
+
+  const reconnect = useCallback(
+    async (connectionId: string) => {
+      return reconnectMutation.mutateAsync(connectionId);
+    },
+    [reconnectMutation],
+  );
+
+  const disconnect = useCallback(
+    async (connectionId: string) => {
+      return disconnectMutation.mutateAsync(connectionId);
+    },
+    [disconnectMutation],
+  );
+
+  const remove = useCallback(
+    async (connectionId: string) => {
+      return deleteMutation.mutateAsync(connectionId);
+    },
+    [deleteMutation],
+  );
+
+  const rename = useCallback(
+    async (connectionId: string, name: string) => {
+      return updateMutation.mutateAsync({ connectionId, data: { name } });
+    },
+    [updateMutation],
+  );
+
+  return {
+    create,
+    reconnect,
+    disconnect,
+    remove,
+    rename,
+    isCreating: createMutation.isPending,
+    isDeleting: deleteMutation.isPending,
+    isUpdating: updateMutation.isPending,
+  };
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@blwhatsappcopy/database",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Database client and migrations for blwhatsappcopy",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "db:migrate": "bun run migrate.ts",
+    "db:generate": "bunx kysely-codegen --out-file ./src/types/database.ts"
+  },
+  "dependencies": {
+    "@blwhatsappcopy/shared": "workspace:*",
+    "kysely": "^0.28.17",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "typescript": "^5.7.2",
+    "tsup": "^8.0.1",
+    "kysely-codegen": "^0.20.0"
+  }
+}

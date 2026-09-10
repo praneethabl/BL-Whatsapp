@@ -1,0 +1,39 @@
+{
+  "name": "blwhatsappcopy",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "turbo build --concurrency=3",
+    "preview:connection-emails": "bun --preload ./apps/api/src/test-env.ts scripts/preview-connection-emails.ts",
+    "dev": "turbo dev",
+    "lint": "biome lint apps/api apps/web packages && ./scripts/lint-go.sh",
+    "typecheck": "bun run --filter @blwhatsappcopy/shared build && bun run --filter @blwhatsappcopy/database build && tsc -p apps/api/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json --noEmit",
+    "check:unused": "knip",
+    "format": "biome format --write apps/api apps/web packages",
+    "test": "./scripts/run-tests.sh",
+    "test:db-contracts": "DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@localhost:4447/blwhatsappcopy} RUN_DB_INTEGRATION=1 bun test apps/api/src/services/search.integration.test.ts apps/api/src/services/tenant-schema.integration.test.ts apps/api/src/services/auth-email-verification.integration.test.ts",
+    "test:groups": "DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@localhost:4447/blwhatsappcopy} RUN_DB_INTEGRATION=1 RATE_LIMIT_ENABLED=false bun test apps/api/src/routes/groups/administration.integration.test.ts apps/api/src/services/group-administration-sync.integration.test.ts apps/api/src/services/group-sync.integration.test.ts",
+    "test:sla-analytics": "DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@localhost:4447/blwhatsappcopy} RUN_DB_INTEGRATION=1 RATE_LIMIT_ENABLED=false bun test apps/api/src/services/analytics/response-time.integration.test.ts apps/api/src/services/analytics/team-response-time.integration.test.ts apps/api/src/services/analytics/case-resolution.integration.test.ts apps/api/src/services/sla-policy/policy.service.integration.test.ts apps/api/src/routes/companies/sla-policy.integration.test.ts apps/api/src/services/conversation-case.service.integration.test.ts apps/api/src/services/handlers/message-handlers.case-lifecycle.integration.test.ts apps/api/src/routes/conversations/state.integration.test.ts apps/api/src/services/send-access.service.integration.test.ts apps/api/src/routes/messages/send.integration.test.ts apps/api/src/routes/actions/typing.integration.test.ts apps/api/src/routes/messages/reactions.integration.test.ts apps/api/src/routes/contacts/assignment.integration.test.ts apps/api/src/services/assignment-broadcast.service.integration.test.ts",
+    "test:integration": "./scripts/run-integration-tests-ts.sh && ./scripts/run-integration-tests-go.sh",
+    "test:integration:ts": "./scripts/run-integration-tests-ts.sh",
+    "test:integration:go": "./scripts/run-integration-tests-go.sh",
+    "test:go:race": "./scripts/run-go-race.sh",
+    "clean": "turbo clean",
+    "db:migrate": "turbo db:migrate",
+    "db:generate": "turbo db:generate"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.11",
+    "knip": "5.85.0",
+    "turbo": "^2.10.12",
+    "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
+  },
+  "packageManager": "bun@1.2.18"
+}

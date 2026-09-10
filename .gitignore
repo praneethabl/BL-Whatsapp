@@ -1,0 +1,97 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Build outputs
+dist
+build
+stats.html
+*.tsbuildinfo
+.next
+out
+.turbo
+
+# Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.production
+
+# Operator-created production material
+secrets/
+backups/
+*.dump
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage
+coverage.out
+.nyc_output
+
+# Playwright
+playwright-report/
+**/playwright/.auth/
+test-results/
+blob-report/
+
+# Database
+*.sqlite
+*.db
+
+# Go
+services/*/bin/
+services/*/*.exe
+services/whatsapp/whatsapp-worker
+services/orchestrator/orchestrator
+
+# Air (Go hot-reload)
+services/*/tmp/
+
+# Astro
+.astro/
+
+# Cloudflare Workers local state and local-only secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
+.dev-runtime/
+!.dev.vars.example
+
+# Temp
+tmp
+.temp
+
+# Bun
+bun.lockb
+
+# Ralph Wiggum
+.claude/*.local.md
+
+# Improvement loop artifacts
+.loop/
+.worktrees/
+tasks.md
+
+# Local standalone services
+pgsql/
+nats-server-*/
+*.zip

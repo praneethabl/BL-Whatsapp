@@ -1,0 +1,371 @@
+import { formatChatListTime } from "@blwhatsappcopy/shared";
+import { memo, useCallback, useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import { IdentityAvatarFallback } from "@/components/ui/identity-avatar-fallback";
+import { useAuth } from "@/contexts/auth-context";
+import {
+  extractPhoneFromJID,
+  formatPhoneLikeText,
+  formatPhoneNumber,
+} from "@/lib/utils";
+import type { ChatListItemProps } from "../../types/chat";
+import { ConnectionBadge } from "./ConnectionIdentity";
+import { ConversationStatusBadge } from "./ConversationStatusBadge";
+import { resolveMentionNames } from "./group-mentions";
+
+/**
+ * Truncate message content for preview display
+ */
+function truncateMessage(content: string, maxLength: number = 45): string {
+  if (content.length <= maxLength) return content;
+  return `${content.substring(0, maxLength).trim()}…`;
+}
+
+/**
+ * Individual chat list item component
+ * Displays avatar, contact name, last message preview, timestamp, and unread count
+ */
+export const ChatListItem = memo(function ChatListItem({
+  chat,
+  isSelected,
+  onClick,
+  onPrefetch,
+}: ChatListItemProps) {
+  const { t } = useTranslation();
+
+  const { contact, lastMessage, unreadCount } = chat;
+  const { user } = useAuth();
+
+  // Memoize prefetch handler to prevent unnecessary re-renders
+  const handlePrefetch = useCallback(() => {
+    onPrefetch?.(chat.id);
+  }, [onPrefetch, chat.id]);
+
+  // Display priority: customName > pushName > formatted phone number > 'Unknown'
+  const displayName = useMemo(() => {
+    if (contact.customName) return formatPhoneLikeText(contact.customName);
+    if (contact.name) return formatPhoneLikeText(contact.name);
+    // Use phone number if available, otherwise extract from JID
+    const phone = contact.phoneNumber || extractPhoneFromJID(contact.jid);
+    if (phone) return formatPhoneNumber(phone);
+    return t("chat.unknownContact", "Unknown contact");
+  }, [contact.customName, contact.name, contact.phoneNumber, contact.jid, t]);
+
+  const formattedTime = useMemo(() => {
+    if (!lastMessage) return "";
+    return formatChatListTime(lastMessage.timestamp, t);
+  }, [lastMessage, t]);
+
+  const messagePreview = useMemo(() => {
+    if (!lastMessage) return t("chat.noMessages", "No messages yet");
+
+    // Attribute shared-inbox replies to the teammate who actually sent them.
+    const prefix = lastMessage.isFromMe
+      ? lastMessage.sentByUserId === user?.id
+        ? `${t("chat.you", "You")}: `
+        : lastMessage.sentByUserName
+          ? `${lastMessage.sentByUserName}: `
+          : `${t("chat.fromPhone", "From phone")}: `
+      : "";
+
+    if (lastMessage.isDeleted) {
+      return `${prefix}${t("chat.messageDeleted", "This message was deleted")}`;
+    }
+
+    switch (lastMessage.type) {
+      case "image":
+        return `${prefix}${t("chat.mediaTypes.image", "Photo")}`;
+      case "video":
+        return `${prefix}${t("chat.mediaTypes.video", "Video")}`;
+      case "audio":
+        return `${prefix}${t("chat.mediaTypes.audio", "Audio")}`;
+      case "document":
+        return `${prefix}${t("chat.mediaTypes.document", "Document")}`;
+      case "sticker":
+        return `${prefix}${t("chat.mediaTypes.sticker", "Sticker")}`;
+      case "location":
+        return `${prefix}${t("chat.mediaTypes.location", "Location")}`;
+      case "contact":
+        return lastMessage.content
+          ? `${prefix}${t("chat.sharedContactPreview", {
+              defaultValue: "Contact: {{name}}",
+              name: lastMessage.content,
+            })}`
+          : `${prefix}${t("chat.mediaTypes.contact", "Contact")}`;
+      default: {
+        const content = contact.isGroup
+          ? resolveMentionNames(
+              lastMessage.content,
+              (lastMessage.mentionParticipants || []).map((participant) => ({
+                jid: "",
+                phoneNumber: null,
+                contactId: null,
+                ...participant,
+              })),
+            )
+          : lastMessage.content;
+        return prefix + truncateMessage(content);
+      }
+    }
+  }, [contact.isGroup, lastMessage, user?.id, t]);
+
+  // Build accessible label with contact name, message preview, and status
+  const accessibleLabel = useMemo(() => {
+    const parts = [displayName];
+    if (messagePreview) parts.push(messagePreview);
+    if (formattedTime) parts.push(formattedTime);
+    if (unreadCount > 0)
+      parts.push(
+        t("chat.unreadMessages", {
+          defaultValue: "{{count}} unread message",
+          defaultValue_plural: "{{count}} unread messages",
+          count: unreadCount,
+        }),
+      );
+    if (chat.isMuted) parts.push(t("chat.mutedLabel", "muted"));
+    if (chat.isPinned) parts.push(t("chat.pinnedLabel", "pinned"));
+    if (contact.connection) {
+      parts.push(
+        t("chat.receivedOn", {
+          defaultValue: "received on {{account}}",
+          account:
+            contact.connection.name ||
+            contact.connection.phoneNumber ||
+            t("chat.whatsappAccount", "WhatsApp account"),
+        }),
+      );
+    }
+    return parts.join(", ");
+  }, [
+    displayName,
+    messagePreview,
+    formattedTime,
+    unreadCount,
+    chat.isMuted,
+    chat.isPinned,
+    contact.connection,
+    t,
+  ]);
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={handlePrefetch}
+      className={`w-full flex items-center gap-3 px-3 text-left
+                  transition-colors duration-150 border-b border-gray-100 dark:border-dark-border
+                  touch-manipulation active:bg-gray-200 dark:active:bg-dark-border
+                  ${isSelected ? "bg-gray-200 dark:bg-dark-tertiary" : "hover:bg-gray-50 dark:hover:bg-dark-elevated"}
+                  py-3 md:py-3 min-h-[72px] md:min-h-0`}
+      aria-selected={isSelected}
+      aria-current={isSelected ? "true" : undefined}
+      aria-label={accessibleLabel}
+      role="option"
+    >
+      {/* Avatar with Online Indicator */}
+      <div className="relative flex-shrink-0">
+        <div className="w-12 h-12 rounded-full overflow-hidden bg-gray-200 dark:bg-dark-tertiary">
+          {contact.avatarUrl ? (
+            <img
+              src={contact.avatarUrl}
+              alt={displayName}
+              width={48}
+              height={48}
+              className="w-full h-full object-cover"
+              loading="lazy"
+            />
+          ) : contact.isGroup ? (
+            // Group avatar - show group icon
+            <div className="w-full h-full flex items-center justify-center bg-gray-400 dark:bg-dark-text-tertiary text-white">
+              <svg
+                className="w-6 h-6"
+                fill="currentColor"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path d="M12 12.75c1.63 0 3.07.39 4.24.9 1.08.48 1.76 1.56 1.76 2.73V18H6v-1.62c0-1.17.68-2.25 1.76-2.73 1.17-.51 2.61-.9 4.24-.9zM4 13c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm1.13 1.1c-.37-.06-.74-.1-1.13-.1-.99 0-1.93.21-2.78.58A2.01 2.01 0 000 16.43V18h4.5v-1.62c0-.83.23-1.61.63-2.28zM20 13c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm4 3.43c0-.81-.48-1.53-1.22-1.85A6.95 6.95 0 0020 14c-.39 0-.76.04-1.13.1.4.67.63 1.45.63 2.28V18H24v-1.57zM12 6c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3z" />
+              </svg>
+            </div>
+          ) : (
+            <IdentityAvatarFallback
+              displayName={displayName}
+              identity={contact.jid || contact.phoneNumber || contact.id}
+              className="text-lg"
+            />
+          )}
+        </div>
+        {/* Online Indicator - only for individual contacts */}
+        {!contact.isGroup && contact.isOnline && (
+          <span
+            className="absolute bottom-0 right-0 w-3 h-3 bg-whatsapp-green
+                       border-2 border-white dark:border-dark-secondary rounded-full"
+            aria-label={t("chat.online", "Online")}
+          />
+        )}
+      </div>
+
+      {/* Chat Info */}
+      <div className="flex-1 min-w-0">
+        {/* Top Row: Name and Time */}
+        <div className="flex items-center justify-between gap-2">
+          <span
+            className={`text-base truncate ${
+              unreadCount > 0
+                ? "font-semibold text-gray-900 dark:text-dark-text-primary"
+                : "text-gray-900 dark:text-dark-text-primary"
+            }`}
+          >
+            {displayName}
+          </span>
+          <span
+            className={`text-xs flex-shrink-0 ${
+              unreadCount > 0
+                ? "text-whatsapp-green font-medium"
+                : "text-gray-500 dark:text-dark-text-secondary"
+            }`}
+          >
+            {formattedTime}
+          </span>
+        </div>
+
+        {/* Bottom Row: Message Preview and Unread Badge */}
+        <div className="flex items-center justify-between gap-2 mt-0.5">
+          <div className="flex items-center gap-1 min-w-0 flex-1">
+            {chat.conversationStatus !== "open" && (
+              <ConversationStatusBadge status={chat.conversationStatus} />
+            )}
+            {contact.connection && (
+              <ConnectionBadge
+                connection={contact.connection}
+                compact
+                className="max-w-[92px] shrink-0"
+              />
+            )}
+            {/* Message Status Icon for sent messages */}
+            {lastMessage?.isFromMe && !lastMessage.isDeleted && (
+              <span className="flex-shrink-0" aria-hidden="true">
+                {lastMessage.status === "read" && (
+                  <svg
+                    className="w-4 h-4 text-blue-500"
+                    fill="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41zM.41 13.41L6 19l1.41-1.41L1.83 12 .41 13.41z" />
+                  </svg>
+                )}
+                {lastMessage.status === "delivered" && (
+                  <svg
+                    className="w-4 h-4 text-gray-400 dark:text-dark-text-tertiary"
+                    fill="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41zM.41 13.41L6 19l1.41-1.41L1.83 12 .41 13.41z" />
+                  </svg>
+                )}
+                {lastMessage.status === "sent" && (
+                  <svg
+                    className="w-4 h-4 text-gray-400 dark:text-dark-text-tertiary"
+                    fill="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z" />
+                  </svg>
+                )}
+                {lastMessage.status === "sending" && (
+                  <svg
+                    className="w-4 h-4 text-gray-400 dark:text-dark-text-tertiary animate-pulse"
+                    fill="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle cx="12" cy="12" r="10" />
+                  </svg>
+                )}
+              </span>
+            )}
+            <span
+              className={`text-sm truncate ${
+                unreadCount > 0
+                  ? "text-gray-700 dark:text-dark-text-primary"
+                  : "text-gray-500 dark:text-dark-text-secondary"
+              }`}
+            >
+              {messagePreview}
+            </span>
+          </div>
+
+          {/* Indicators: Muted, Pinned, Unread */}
+          <div className="flex items-center gap-1.5 flex-shrink-0">
+            {/* Muted Icon */}
+            {chat.isMuted && (
+              <svg
+                className="w-4 h-4 text-gray-400 dark:text-dark-text-tertiary"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"
+                />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2"
+                />
+              </svg>
+            )}
+
+            {/* Pinned Icon */}
+            {chat.isPinned && (
+              <svg
+                className="w-4 h-4 text-gray-400 dark:text-dark-text-tertiary"
+                fill="currentColor"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z" />
+              </svg>
+            )}
+
+            {/* Unread Badge */}
+            {unreadCount > 0 && (
+              <span
+                className="flex items-center justify-center min-w-[20px] h-5 px-1.5
+                           text-xs font-medium text-white bg-whatsapp-green rounded-full tabular-nums"
+              >
+                {unreadCount > 99 ? "99+" : unreadCount}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    </button>
+  );
+});
+
+/**
+ * Loading skeleton for chat list item
+ */
+export function ChatListItemSkeleton() {
+  return (
+    <div className="flex items-center gap-3 px-3 py-3 border-b border-gray-100 dark:border-dark-border animate-pulse">
+      {/* Avatar Skeleton */}
+      <div className="w-12 h-12 rounded-full bg-gray-200 dark:bg-dark-tertiary flex-shrink-0" />
+
+      {/* Content Skeleton */}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between gap-2">
+          <div className="h-4 bg-gray-200 dark:bg-dark-tertiary rounded w-32" />
+          <div className="h-3 bg-gray-200 dark:bg-dark-tertiary rounded w-12" />
+        </div>
+        <div className="mt-2 h-3 bg-gray-200 dark:bg-dark-tertiary rounded w-48" />
+      </div>
+    </div>
+  );
+}
+
+export default ChatListItem;
